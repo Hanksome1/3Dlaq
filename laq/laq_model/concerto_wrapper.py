@@ -316,17 +316,27 @@ class ConcertoEncoder(nn.Module):
             image: RGB image [B, C, H, W] in [0, 1] range
             
         Returns:
-            features: [B, H, W, D] Concerto features in image space
+            features: [B, H', W', D] Concerto features (downsampled from input resolution)
         """
         B, C, H, W = image.shape
+        
+        # Target feature size (to avoid OOM in attention)
+        # Concerto typically operates at grid_size=0.02, giving ~16x16 for 256x256 input
+        target_h = max(8, H // 16)
+        target_w = max(8, W // 16)
         
         # Step 1: Get point cloud from VGGT
         vggt_results = self.vggt.encode_single_frame(image)
         point_map = vggt_results['point_map']  # [B, H, W, 3]
         
         if self.concerto is None:
-            # Return dummy features
-            return torch.randn(B, H, W, self.output_dim, device=self.device)
+            # Return dummy features at reduced resolution
+            dummy_features = torch.randn(B, H, W, self.output_dim, device=self.device)
+            # Downsample to target size
+            dummy_features = dummy_features.permute(0, 3, 1, 2)  # [B, D, H, W]
+            dummy_features = F.interpolate(dummy_features, size=(target_h, target_w), mode='bilinear', align_corners=False)
+            dummy_features = dummy_features.permute(0, 2, 3, 1)  # [B, H', W', D]
+            return dummy_features
         
         # Step 2: Prepare Concerto input
         batch_points = self.point_map_to_concerto_input(point_map, image)
@@ -348,15 +358,20 @@ class ConcertoEncoder(nn.Module):
             else:
                 feat = output
             
-            # Reshape to image space [H, W, D]
+            # Reshape to image space and downsample
             if feat is not None and isinstance(feat, torch.Tensor):
-                feat = feat.reshape(H, W, -1)
+                feat = feat.reshape(H, W, -1)  # [H, W, D]
+                # Downsample
+                feat = feat.permute(2, 0, 1).unsqueeze(0)  # [1, D, H, W]
+                feat = F.interpolate(feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
+                feat = feat.squeeze(0).permute(1, 2, 0)  # [H', W', D]
             else:
-                feat = torch.randn(H, W, self.output_dim, device=self.device)
+                feat = torch.randn(target_h, target_w, self.output_dim, device=self.device)
             
             all_features.append(feat)
         
-        return torch.stack(all_features, dim=0)  # [B, H, W, D]
+        return torch.stack(all_features, dim=0)  # [B, H', W', D]
+
     
     def forward(
         self,
