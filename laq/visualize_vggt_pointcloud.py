@@ -106,9 +106,9 @@ def test_vggt_real(video_path: str, output_dir: str, frame_idx: int = 0):
         print("Failed to read video frame")
         return None
     
-    # Convert to RGB and resize
+    # Convert to RGB and resize (must be divisible by VGGT patch size 14)
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    frame_rgb = cv2.resize(frame_rgb, (256, 256))
+    frame_rgb = cv2.resize(frame_rgb, (224, 224))  # 224 = 14 * 16
     
     # Save original frame
     from PIL import Image
