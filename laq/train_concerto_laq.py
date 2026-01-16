@@ -1,88 +1,93 @@
 """
-Training script for Concerto-LAQ.
+Training script for Concerto-LAQ with Something-Something v2 dataset.
 
-Example usage:
-    # Train with raw video (slower, on-the-fly feature extraction)
-    python train_concerto_laq.py --folder /path/to/videos --batch_size 32
+This script:
+1. Loads webm videos from the dataset directory
+2. Uses VGGT for 3D point cloud generation
+3. Uses Concerto for 2D+3D feature extraction
+4. Trains the LAQ action quantizer
 
-    # Train with pre-computed features (faster)
-    python train_concerto_laq.py --feature_cache_dir /path/to/features --batch_size 64
+Usage:
+    # Quick test (small model, few videos)
+    python train_concerto_laq.py \
+        --data_dir /mnt/nfs/eson/dataset/20bn-something-something-v2 \
+        --max_videos 100 \
+        --batch_size 2 \
+        --num_steps 1000
 
-    # With custom hyperparameters
-    python train_concerto_laq.py --folder /path/to/videos --codebook_size 16 --code_seq_len 4
+    # Full training
+    python train_concerto_laq.py \
+        --data_dir /mnt/nfs/eson/dataset/20bn-something-something-v2 \
+        --batch_size 8 \
+        --num_steps 100000 \
+        --use_wandb
 """
 
 import argparse
+import os
+import sys
 from pathlib import Path
 
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
+sys.path.insert(0, str(Path(__file__).parent))
+
 from laq_model.concerto_laq import ConcertoLAQ
-from laq_model.concerto_trainer import ConcertoLAQTrainer
+from laq_model.webm_dataset import create_dataloader
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train Concerto-LAQ model')
+    parser = argparse.ArgumentParser(description="Train Concerto-LAQ")
     
-    # Data arguments
-    parser.add_argument('--folder', type=str, default='',
-                        help='Path to video folder (for raw video training)')
-    parser.add_argument('--feature_cache_dir', type=str, default=None,
-                        help='Path to pre-computed Concerto features')
-    parser.add_argument('--offset', type=int, default=30,
-                        help='Frame offset between training pairs')
+    # Data
+    parser.add_argument("--data_dir", type=str, required=True,
+                        help="Directory containing .webm video files")
+    parser.add_argument("--max_videos", type=int, default=None,
+                        help="Limit number of videos (for testing)")
+    parser.add_argument("--frame_size", type=int, default=224,
+                        help="Frame size (must be divisible by 14)")
+    parser.add_argument("--frame_offset", type=int, default=5,
+                        help="Frame offset between pairs")
+    parser.add_argument("--samples_per_video", type=int, default=1,
+                        help="Number of samples per video")
     
-    # Model arguments
-    parser.add_argument('--concerto_model', type=str, default='concerto_base',
-                        choices=['concerto_small', 'concerto_base', 'concerto_large'],
-                        help='Concerto model size')
-    parser.add_argument('--concerto_dim', type=int, default=256,
-                        help='Concerto output dimension (256 for base, 512 for large)')
-    parser.add_argument('--dim', type=int, default=1024,
-                        help='Internal model dimension')
-    parser.add_argument('--quant_dim', type=int, default=32,
-                        help='Codebook embedding dimension')
-    parser.add_argument('--codebook_size', type=int, default=8,
-                        help='Number of action codes')
-    parser.add_argument('--code_seq_len', type=int, default=4,
-                        help='Number of action tokens per frame pair')
-    parser.add_argument('--image_size', type=int, default=256,
-                        help='Input image size')
-    parser.add_argument('--spatial_depth', type=int, default=4,
-                        help='Spatial transformer depth')
-    parser.add_argument('--temporal_depth', type=int, default=4,
-                        help='Temporal encoder depth')
-    parser.add_argument('--predictor_depth', type=int, default=4,
-                        help='Latent predictor depth')
-    parser.add_argument('--heads', type=int, default=8,
-                        help='Number of attention heads')
-    parser.add_argument('--dim_head', type=int, default=64,
-                        help='Attention head dimension')
+    # Model
+    parser.add_argument("--concerto_model", type=str, default="concerto_base",
+                        choices=["concerto_small", "concerto_base", "concerto_large"])
+    parser.add_argument("--dim", type=int, default=512,
+                        help="Model dimension")
+    parser.add_argument("--codebook_size", type=int, default=256,
+                        help="Number of action codes")
+    parser.add_argument("--code_seq_len", type=int, default=4,
+                        help="Number of action tokens per frame pair")
+    parser.add_argument("--spatial_depth", type=int, default=4,
+                        help="Depth of spatial transformer")
+    parser.add_argument("--temporal_depth", type=int, default=4,
+                        help="Depth of temporal transformer")
     
-    # Training arguments
-    parser.add_argument('--batch_size', type=int, default=64,
-                        help='Training batch size')
-    parser.add_argument('--num_train_steps', type=int, default=100005,
-                        help='Total training steps')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                        help='Learning rate')
-    parser.add_argument('--grad_accum', type=int, default=1,
-                        help='Gradient accumulation steps')
-    parser.add_argument('--save_every', type=int, default=5000,
-                        help='Save checkpoint every N steps')
-    parser.add_argument('--results_folder', type=str, default='results_concerto',
-                        help='Results directory')
+    # Training
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_steps", type=int, default=100000)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps")
+    parser.add_argument("--num_workers", type=int, default=4)
     
-    # Feature arguments
-    parser.add_argument('--freeze_concerto', action='store_true', default=True,
-                        help='Freeze Concerto weights')
-    parser.add_argument('--use_depth', action='store_true', default=False,
-                        help='Use depth estimation for 3D lifting')
-    parser.add_argument('--depth_model', type=str, default='dummy',
-                        choices=['dummy', 'depth_anything', 'zoedepth'],
-                        help='Depth estimation model')
+    # Checkpointing
+    parser.add_argument("--output_dir", type=str, default="./checkpoints")
+    parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--log_every", type=int, default=100)
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from")
     
-    # WandB
-    parser.add_argument('--wandb_project', type=str, default='concerto_laq',
-                        help='WandB project name')
+    # Logging
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_project", type=str, default="concerto-laq")
+    parser.add_argument("--wandb_run", type=str, default=None)
     
     return parser.parse_args()
 
@@ -90,71 +95,187 @@ def parse_args():
 def main():
     args = parse_args()
     
-    # Determine if using pre-computed features
-    use_precomputed = args.feature_cache_dir is not None
+    # Setup device
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
     
-    # Feature size based on image size and Concerto's downsampling
-    # Concerto typically uses grid_size=0.02, which gives roughly 1/8 downsampling
-    feature_size = (args.image_size // 32, args.image_size // 32)  # Conservative estimate
+    # Create output directory
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    print(f"Creating ConcertoLAQ model...")
-    print(f"  - Concerto model: {args.concerto_model}")
-    print(f"  - Codebook size: {args.codebook_size}")
-    print(f"  - Code sequence length: {args.code_seq_len}")
-    print(f"  - Using pre-computed features: {use_precomputed}")
+    # Initialize wandb
+    if args.use_wandb:
+        import wandb
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run,
+            config=vars(args),
+        )
+    
+    # Create dataloader
+    print("\n" + "="*60)
+    print("Loading Dataset")
+    print("="*60)
+    
+    dataloader = create_dataloader(
+        data_dir=args.data_dir,
+        batch_size=args.batch_size,
+        frame_size=(args.frame_size, args.frame_size),
+        frame_offset=args.frame_offset,
+        num_samples_per_video=args.samples_per_video,
+        max_videos=args.max_videos,
+        num_workers=args.num_workers,
+    )
     
     # Create model
+    print("\n" + "="*60)
+    print("Creating Model")
+    print("="*60)
+    
+    # Concerto output dim
+    concerto_dims = {
+        "concerto_small": 256,
+        "concerto_base": 256,
+        "concerto_large": 512,
+    }
+    
     model = ConcertoLAQ(
         concerto_model_name=args.concerto_model,
-        concerto_dim=args.concerto_dim,
+        concerto_dim=concerto_dims[args.concerto_model],
         dim=args.dim,
-        quant_dim=args.quant_dim,
+        quant_dim=32,
         codebook_size=args.codebook_size,
         code_seq_len=args.code_seq_len,
-        image_size=args.image_size,
-        feature_size=feature_size,
+        image_size=args.frame_size,
+        feature_size=(args.frame_size // 16, args.frame_size // 16),  # Downsampled
         spatial_depth=args.spatial_depth,
         temporal_depth=args.temporal_depth,
-        predictor_depth=args.predictor_depth,
-        dim_head=args.dim_head,
-        heads=args.heads,
-        freeze_concerto=args.freeze_concerto,
-        use_depth=args.use_depth,
-        depth_model_type=args.depth_model,
-        use_precomputed_features=use_precomputed,
-    ).cuda()
+        predictor_depth=4,
+        freeze_concerto=True,
+        use_precomputed_features=False,
+    )
+    
+    model = model.to(device)
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  - Total parameters: {total_params:,}")
-    print(f"  - Trainable parameters: {trainable_params:,}")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
     
-    # Create trainer
-    trainer = ConcertoLAQTrainer(
-        model,
-        folder=args.folder,
-        num_train_steps=args.num_train_steps,
-        batch_size=args.batch_size,
+    # Optimizer
+    optimizer = AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
         lr=args.lr,
-        grad_accum_every=args.grad_accum,
-        save_model_every=args.save_every,
-        save_results_every=args.save_every,
-        results_folder=args.results_folder,
-        use_precomputed_features=use_precomputed,
-        feature_cache_dir=args.feature_cache_dir,
-        offset=args.offset,
-        wandb_project=args.wandb_project,
+        weight_decay=args.weight_decay,
     )
     
-    print(f"\nStarting training...")
-    print(f"  - Batch size: {args.batch_size}")
-    print(f"  - Learning rate: {args.lr}")
-    print(f"  - Total steps: {args.num_train_steps}")
-    print(f"  - Results folder: {args.results_folder}")
+    # Scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_steps)
     
-    trainer.train()
+    # Resume from checkpoint
+    start_step = 0
+    if args.resume:
+        print(f"\nResuming from {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        start_step = checkpoint["step"]
+        print(f"Resumed from step {start_step}")
+    
+    # Training loop
+    print("\n" + "="*60)
+    print("Starting Training")
+    print("="*60)
+    
+    model.train()
+    data_iter = iter(dataloader)
+    
+    running_loss = 0.0
+    running_unique = 0.0
+    
+    for step in range(start_step, args.num_steps):
+        # Get batch
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
+        
+        video = batch["video"].to(device)  # [B, C, 2, H, W]
+        
+        # Forward pass
+        try:
+            loss, num_unique = model(video=video, step=step)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"Warning: OOM at step {step}, skipping batch")
+                torch.cuda.empty_cache()
+                continue
+            raise e
+        
+        # Backward pass
+        loss = loss / args.grad_accum
+        loss.backward()
+        
+        if (step + 1) % args.grad_accum == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+            scheduler.step()
+        
+        # Accumulate stats
+        running_loss += loss.item() * args.grad_accum
+        running_unique += num_unique
+        
+        # Logging
+        if (step + 1) % args.log_every == 0:
+            avg_loss = running_loss / args.log_every
+            avg_unique = running_unique / args.log_every
+            lr = scheduler.get_last_lr()[0]
+            
+            print(f"Step {step+1}/{args.num_steps} | "
+                  f"Loss: {avg_loss:.4f} | "
+                  f"Unique codes: {avg_unique:.1f} | "
+                  f"LR: {lr:.2e}")
+            
+            if args.use_wandb:
+                wandb.log({
+                    "loss": avg_loss,
+                    "unique_codes": avg_unique,
+                    "lr": lr,
+                }, step=step+1)
+            
+            running_loss = 0.0
+            running_unique = 0.0
+        
+        # Save checkpoint
+        if (step + 1) % args.save_every == 0:
+            checkpoint_path = os.path.join(
+                args.output_dir,
+                f"checkpoint_{step+1}.pt"
+            )
+            torch.save({
+                "step": step + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "args": vars(args),
+            }, checkpoint_path)
+            print(f"Saved checkpoint to {checkpoint_path}")
+    
+    # Final save
+    final_path = os.path.join(args.output_dir, "final_model.pt")
+    torch.save({
+        "step": args.num_steps,
+        "model": model.state_dict(),
+        "args": vars(args),
+    }, final_path)
+    print(f"\nTraining complete! Final model saved to {final_path}")
+    
+    if args.use_wandb:
+        wandb.finish()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
