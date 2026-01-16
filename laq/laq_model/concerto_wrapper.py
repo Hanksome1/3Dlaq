@@ -1,217 +1,204 @@
 """
-Concerto Wrapper Module for Latent Action Quantization.
+Concerto Wrapper Module with VGGT Integration.
 
 This module provides a wrapper around the pre-trained Concerto model (PTv3 backbone)
-for extracting 2D+3D aware features from video frames.
+using VGGT (Visual Geometry Grounded Transformer) for:
+- Single-frame depth estimation
+- Camera intrinsics estimation  
+- 3D point cloud generation
 
-Concerto: Joint 2D-3D Self-Supervised Learning Emerges Spatial Representations
-https://github.com/Pointcept/Concerto
+VGGT: https://github.com/facebookresearch/vggt
+Concerto: https://github.com/Pointcept/Concerto
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Optional, Dict, Tuple, Union
+from typing import Optional, Dict, Tuple, Union, List
+from pathlib import Path
 
 
-class DepthEstimator(nn.Module):
+class VGGTEncoder(nn.Module):
     """
-    Monocular depth estimation wrapper.
+    VGGT-based encoder for single-frame depth and camera estimation.
     
-    Supports multiple backends:
-    - depth_anything: Fast and accurate monocular depth
-    - zoedepth: High quality depth estimation
-    - dummy: Returns uniform depth for testing
+    VGGT can estimate from a single image:
+    - Depth map
+    - Camera intrinsics (focal length, principal point)
+    - Camera extrinsics (pose)
+    - Direct point map
+    
+    Args:
+        model_name: VGGT model variant (default: "facebook/VGGT-1B")
+        device: Device to run on
+        dtype: Data type for inference (bfloat16 on Ampere+, else float16)
     """
     
     def __init__(
         self,
-        model_type: str = "depth_anything",
-        model_size: str = "base",
+        model_name: str = "facebook/VGGT-1B",
         device: str = "cuda",
+        use_bfloat16: bool = True,
     ):
         super().__init__()
-        self.model_type = model_type
         self.device = device
+        self.model_name = model_name
         self.model = None
         
-        if model_type == "depth_anything":
-            self._load_depth_anything(model_size)
-        elif model_type == "zoedepth":
-            self._load_zoedepth()
-        elif model_type == "dummy":
-            pass  # No model needed
+        # Determine dtype based on GPU capability
+        if device == "cuda" and torch.cuda.is_available():
+            capability = torch.cuda.get_device_capability()[0]
+            self.dtype = torch.bfloat16 if (capability >= 8 and use_bfloat16) else torch.float16
         else:
-            raise ValueError(f"Unknown depth model type: {model_type}")
+            self.dtype = torch.float32
+        
+        self._load_model()
     
-    def _load_depth_anything(self, model_size: str = "base"):
-        """Load Depth Anything model."""
+    def _load_model(self):
+        """Load VGGT model from HuggingFace."""
         try:
-            from transformers import pipeline
-            self.model = pipeline(
-                task="depth-estimation",
-                model=f"depth-anything/Depth-Anything-V2-{model_size.capitalize()}-hf",
-                device=0 if self.device == "cuda" else -1,
-            )
-        except ImportError:
-            print("Warning: transformers not installed. Using dummy depth estimator.")
-            self.model_type = "dummy"
-    
-    def _load_zoedepth(self):
-        """Load ZoeDepth model."""
-        try:
-            import torch.hub
-            self.model = torch.hub.load(
-                "isl-org/ZoeDepth", "ZoeD_NK", pretrained=True
-            ).to(self.device)
+            from vggt.models.vggt import VGGT
+            self.model = VGGT.from_pretrained(self.model_name).to(self.device)
             self.model.eval()
+            print(f"Loaded VGGT model: {self.model_name}")
+        except ImportError:
+            print("Warning: vggt package not installed. Using dummy encoder.")
+            print("Install with: pip install -e . (from vggt repo)")
+            self.model = None
         except Exception as e:
-            print(f"Warning: Failed to load ZoeDepth: {e}. Using dummy depth estimator.")
-            self.model_type = "dummy"
+            print(f"Warning: Failed to load VGGT model: {e}")
+            self.model = None
+    
+    @staticmethod
+    def preprocess_images(images: torch.Tensor) -> torch.Tensor:
+        """
+        Preprocess images for VGGT.
+        
+        Args:
+            images: [B, C, H, W] in [0, 1] range
+            
+        Returns:
+            Preprocessed images ready for VGGT
+        """
+        # VGGT expects images in a specific format
+        # Normalize if needed (VGGT's load_and_preprocess_images handles this)
+        return images
     
     @torch.no_grad()
-    def forward(
+    def encode_single_frame(
         self,
-        images: torch.Tensor,  # [B, C, H, W] or [B, T, C, H, W]
-    ) -> torch.Tensor:
-        """
-        Estimate depth from RGB images.
-        
-        Args:
-            images: RGB images in [0, 1] range
-            
-        Returns:
-            depth: Depth maps [B, H, W] or [B, T, H, W]
-        """
-        has_time_dim = images.ndim == 5
-        if has_time_dim:
-            B, T, C, H, W = images.shape
-            images = images.reshape(B * T, C, H, W)
-        
-        if self.model_type == "dummy":
-            # Return uniform depth
-            depth = torch.ones(images.shape[0], images.shape[2], images.shape[3], device=images.device)
-        elif self.model_type == "depth_anything":
-            # Process through pipeline (expects PIL images or numpy)
-            depth_list = []
-            for img in images:
-                img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                result = self.model(img_np)
-                depth_list.append(torch.from_numpy(np.array(result["depth"])))
-            depth = torch.stack(depth_list).to(images.device)
-        elif self.model_type == "zoedepth":
-            depth = self.model.infer(images)
-        else:
-            raise ValueError(f"Unknown model type: {self.model_type}")
-        
-        if has_time_dim:
-            depth = depth.reshape(B, T, H, W)
-        
-        return depth
-
-
-class PointCloudLifter(nn.Module):
-    """
-    Lifts 2D images to 3D point clouds using depth maps.
-    
-    Handles back-projection from 2D to 3D using camera intrinsics.
-    """
-    
-    def __init__(
-        self,
-        default_fx: float = 500.0,  # Default focal length (pixels)
-        default_fy: float = 500.0,
-        default_cx: Optional[float] = None,  # Principal point (default: image center)
-        default_cy: Optional[float] = None,
-    ):
-        super().__init__()
-        self.default_fx = default_fx
-        self.default_fy = default_fy
-        self.default_cx = default_cx
-        self.default_cy = default_cy
-    
-    def forward(
-        self,
-        rgb: torch.Tensor,  # [B, C, H, W]
-        depth: torch.Tensor,  # [B, H, W]
-        fx: Optional[float] = None,
-        fy: Optional[float] = None,
-        cx: Optional[float] = None,
-        cy: Optional[float] = None,
+        image: torch.Tensor,  # [B, C, H, W] or [C, H, W]
     ) -> Dict[str, torch.Tensor]:
         """
-        Lift 2D image to 3D point cloud.
+        Encode a single frame to get depth, camera params, and point cloud.
         
         Args:
-            rgb: RGB image [B, C, H, W]
-            depth: Depth map [B, H, W]
-            fx, fy: Focal lengths
-            cx, cy: Principal points
+            image: RGB image in [0, 1] range
             
         Returns:
-            dict with:
-                coord: [B, N, 3] point coordinates
-                color: [B, N, 3] point colors (normalized)
-                batch: [B, N] batch indices (for batched processing)
+            Dict with:
+                - depth_map: [B, H, W] depth values
+                - intrinsic: [B, 3, 3] camera intrinsic matrix
+                - extrinsic: [B, 4, 4] camera extrinsic matrix
+                - point_map: [B, H, W, 3] 3D point coordinates
+                - point_conf: [B, H, W] confidence scores
         """
-        B, C, H, W = rgb.shape
-        device = rgb.device
+        if image.ndim == 3:
+            image = image.unsqueeze(0)
         
-        # Use defaults if not provided
-        fx = fx or self.default_fx
-        fy = fy or self.default_fy
-        cx = cx if cx is not None else W / 2.0
-        cy = cy if cy is not None else H / 2.0
+        B, C, H, W = image.shape
         
-        # Create pixel coordinate grids
-        u = torch.arange(W, device=device).float()
-        v = torch.arange(H, device=device).float()
-        u, v = torch.meshgrid(u, v, indexing='xy')
-        u = u.unsqueeze(0).expand(B, -1, -1)  # [B, H, W]
-        v = v.unsqueeze(0).expand(B, -1, -1)
+        if self.model is None:
+            # Return dummy values for testing
+            return {
+                'depth_map': torch.ones(B, H, W, device=self.device),
+                'intrinsic': torch.eye(3, device=self.device).unsqueeze(0).expand(B, -1, -1),
+                'extrinsic': torch.eye(4, device=self.device).unsqueeze(0).expand(B, -1, -1),
+                'point_map': self._dummy_point_map(B, H, W),
+                'point_conf': torch.ones(B, H, W, device=self.device),
+            }
         
-        # Back-project to 3D
-        z = depth  # [B, H, W]
-        x = (u - cx) * z / fx
-        y = (v - cy) * z / fy
+        # Add batch dimension for VGGT (it expects [batch, num_images, C, H, W])
+        images = image.unsqueeze(0)  # [1, B, C, H, W] - treating B as num_images
         
-        # Stack coordinates
-        coords = torch.stack([x, y, z], dim=-1)  # [B, H, W, 3]
-        coords = coords.reshape(B, H * W, 3)  # [B, N, 3]
+        with torch.cuda.amp.autocast(dtype=self.dtype):
+            # Get aggregated tokens
+            aggregated_tokens_list, ps_idx = self.model.aggregator(images)
+            
+            # Predict cameras
+            pose_enc = self.model.camera_head(aggregated_tokens_list)[-1]
+            
+            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+            extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+            
+            # Predict depth
+            depth_map, depth_conf = self.model.depth_head(aggregated_tokens_list, images, ps_idx)
+            
+            # Predict point map (alternative to unprojection)
+            point_map, point_conf = self.model.point_head(aggregated_tokens_list, images, ps_idx)
         
-        # Get colors (permute to [B, H, W, C] then flatten)
-        colors = rgb.permute(0, 2, 3, 1).reshape(B, H * W, C)  # [B, N, 3]
-        
-        # Create batch indices for Concerto's batch format
-        batch_indices = torch.arange(B, device=device).unsqueeze(1).expand(-1, H * W)
-        batch_indices = batch_indices.reshape(B * H * W)  # [B*N]
-        
+        # Remove the extra batch dimension
         return {
-            "coord": coords,
-            "color": colors,
-            "batch": batch_indices,
-            "height": H,
-            "width": W,
+            'depth_map': depth_map.squeeze(0),  # [B, H, W]
+            'intrinsic': intrinsic.squeeze(0),  # [B, 3, 3]
+            'extrinsic': extrinsic.squeeze(0),  # [B, 4, 4]
+            'point_map': point_map.squeeze(0),  # [B, H, W, 3]
+            'point_conf': point_conf.squeeze(0),  # [B, H, W]
         }
+    
+    def _dummy_point_map(self, B: int, H: int, W: int) -> torch.Tensor:
+        """Generate dummy point map for testing without VGGT."""
+        # Create a simple grid-based point cloud
+        u = torch.linspace(-1, 1, W, device=self.device)
+        v = torch.linspace(-1, 1, H, device=self.device)
+        uu, vv = torch.meshgrid(u, v, indexing='xy')
+        z = torch.ones_like(uu)
+        
+        point_map = torch.stack([uu, vv, z], dim=-1)  # [H, W, 3]
+        return point_map.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 3]
+    
+    @torch.no_grad()
+    def encode_video_pair(
+        self,
+        video: torch.Tensor,  # [B, C, 2, H, W]
+    ) -> Tuple[Dict, Dict]:
+        """
+        Encode a pair of video frames.
+        
+        Args:
+            video: Two consecutive frames [B, C, 2, H, W]
+            
+        Returns:
+            results_t0: Dict with depth, intrinsic, extrinsic, point_map for frame 0
+            results_t1: Dict with depth, intrinsic, extrinsic, point_map for frame 1
+        """
+        frame_t0 = video[:, :, 0]  # [B, C, H, W]
+        frame_t1 = video[:, :, 1]  # [B, C, H, W]
+        
+        results_t0 = self.encode_single_frame(frame_t0)
+        results_t1 = self.encode_single_frame(frame_t1)
+        
+        return results_t0, results_t1
 
 
 class ConcertoEncoder(nn.Module):
     """
-    Wrapper for Concerto pre-trained model.
+    Wrapper for Concerto pre-trained model with VGGT integration.
     
-    Provides interface for extracting 2D+3D aware features from video frames.
-    The features can be used for downstream tasks like latent action prediction.
+    Pipeline:
+    1. VGGT extracts depth + camera params + point cloud from each frame
+    2. Point cloud is processed through Concerto (PTv3)
+    3. Features are mapped back to 2D for downstream tasks
     
     Args:
-        model_name: One of "concerto_small" (39M), "concerto_base" (108M), "concerto_large" (208M)
-        freeze: Whether to freeze Concerto weights
+        concerto_model_name: Concerto model size
+        vggt_model_name: VGGT model name on HuggingFace
+        freeze_concerto: Whether to freeze Concerto weights
+        freeze_vggt: Whether to freeze VGGT weights (should be True)
         device: Device to run on
-        depth_estimator: Optional depth estimator instance
-        grid_size: Grid size for point cloud sampling (controls point density)
     """
     
-    # Output dimensions for each model size
     MODEL_DIMS = {
         "concerto_small": 256,
         "concerto_base": 256,
@@ -220,37 +207,40 @@ class ConcertoEncoder(nn.Module):
     
     def __init__(
         self,
-        model_name: str = "concerto_base",
-        freeze: bool = True,
+        concerto_model_name: str = "concerto_base",
+        vggt_model_name: str = "facebook/VGGT-1B",
+        freeze_concerto: bool = True,
+        freeze_vggt: bool = True,
         device: str = "cuda",
-        depth_estimator: Optional[DepthEstimator] = None,
         grid_size: float = 0.02,
     ):
         super().__init__()
-        self.model_name = model_name
         self.device = device
-        self.freeze = freeze
+        self.concerto_model_name = concerto_model_name
+        self.output_dim = self.MODEL_DIMS.get(concerto_model_name, 256)
         self.grid_size = grid_size
-        self.output_dim = self.MODEL_DIMS.get(model_name, 256)
         
-        # Load Concerto model
-        self.model = self._load_model(model_name)
-        if freeze and self.model is not None:
-            for param in self.model.parameters():
+        # VGGT encoder for depth + camera estimation
+        self.vggt = VGGTEncoder(
+            model_name=vggt_model_name,
+            device=device,
+        )
+        if freeze_vggt and self.vggt.model is not None:
+            for param in self.vggt.parameters():
                 param.requires_grad = False
-            self.model.eval()
         
-        # Depth estimator
-        self.depth_estimator = depth_estimator or DepthEstimator(model_type="dummy")
+        # Concerto encoder
+        self.concerto = self._load_concerto(concerto_model_name)
+        if freeze_concerto and self.concerto is not None:
+            for param in self.concerto.parameters():
+                param.requires_grad = False
+            self.concerto.eval()
         
-        # Point cloud lifter
-        self.lifter = PointCloudLifter()
-        
-        # Transform pipeline (following Concerto's default)
+        # Transform pipeline for Concerto
         self.transform = None
         self._setup_transform()
     
-    def _load_model(self, model_name: str):
+    def _load_concerto(self, model_name: str):
         """Load pre-trained Concerto model."""
         try:
             import concerto
@@ -264,172 +254,267 @@ class ConcertoEncoder(nn.Module):
             print("Warning: concerto package not installed. Using dummy encoder.")
             return None
         except Exception as e:
-            print(f"Warning: Failed to load Concerto model: {e}. Using dummy encoder.")
+            print(f"Warning: Failed to load Concerto model: {e}")
             return None
     
     def _setup_transform(self):
-        """Set up data transform pipeline following Concerto's defaults."""
+        """Set up Concerto's data transform pipeline."""
         try:
             import concerto
             self.transform = concerto.transform.default()
         except ImportError:
             self.transform = None
     
-    def _apply_transform(self, point_dict: Dict) -> Dict:
-        """Apply Concerto's transform pipeline to point data."""
-        if self.transform is not None:
-            return self.transform(point_dict)
+    def point_map_to_concerto_input(
+        self,
+        point_map: torch.Tensor,  # [B, H, W, 3]
+        colors: torch.Tensor,  # [B, C, H, W]
+    ) -> List[Dict]:
+        """
+        Convert VGGT point map to Concerto input format.
         
-        # Simple fallback transform
-        point_dict["coord"] = point_dict["coord"].float()
-        point_dict["color"] = point_dict["color"].float()
-        return point_dict
+        Args:
+            point_map: 3D coordinates [B, H, W, 3]
+            colors: RGB values [B, C, H, W]
+            
+        Returns:
+            List of point dictionaries for each batch item
+        """
+        B, H, W, _ = point_map.shape
+        
+        # Reshape colors to match point_map
+        colors = colors.permute(0, 2, 3, 1)  # [B, H, W, C]
+        
+        batch_points = []
+        for b in range(B):
+            # Flatten spatial dimensions
+            coords = point_map[b].reshape(-1, 3)  # [N, 3]
+            color = colors[b].reshape(-1, 3)  # [N, 3]
+            
+            point_dict = {
+                "coord": coords.cpu().numpy(),
+                "color": color.cpu().numpy(),
+            }
+            
+            # Apply Concerto transform if available
+            if self.transform is not None:
+                point_dict = self.transform(point_dict)
+            
+            batch_points.append(point_dict)
+        
+        return batch_points
     
     @torch.no_grad()
     def encode_single_frame(
         self,
-        rgb: torch.Tensor,  # [B, C, H, W]
-        depth: Optional[torch.Tensor] = None,  # [B, H, W]
+        image: torch.Tensor,  # [B, C, H, W]
     ) -> torch.Tensor:
         """
         Encode a single frame to Concerto features.
         
         Args:
-            rgb: RGB image [B, C, H, W] in [0, 1] range
-            depth: Optional depth map [B, H, W]
+            image: RGB image [B, C, H, W] in [0, 1] range
             
         Returns:
-            features: [B, H, W, D] feature map in image space
+            features: [B, H, W, D] Concerto features in image space
         """
-        B, C, H, W = rgb.shape
+        B, C, H, W = image.shape
         
-        # Estimate depth if not provided
-        if depth is None:
-            depth = self.depth_estimator(rgb)
+        # Step 1: Get point cloud from VGGT
+        vggt_results = self.vggt.encode_single_frame(image)
+        point_map = vggt_results['point_map']  # [B, H, W, 3]
         
-        # Lift to 3D point cloud
-        point_data = self.lifter(rgb, depth)
+        if self.concerto is None:
+            # Return dummy features
+            return torch.randn(B, H, W, self.output_dim, device=self.device)
         
-        if self.model is None:
-            # Return dummy features if model not loaded
-            return torch.randn(B, H, W, self.output_dim, device=rgb.device)
+        # Step 2: Prepare Concerto input
+        batch_points = self.point_map_to_concerto_input(point_map, image)
         
-        # Process each batch item through Concerto
+        # Step 3: Run through Concerto
         all_features = []
-        for b in range(B):
-            # Prepare single point cloud
-            single_point = {
-                "coord": point_data["coord"][b].cpu().numpy(),
-                "color": point_data["color"][b].cpu().numpy(),
-            }
+        for point_dict in batch_points:
+            # Move tensors to device
+            for key in point_dict:
+                if isinstance(point_dict[key], np.ndarray):
+                    point_dict[key] = torch.from_numpy(point_dict[key]).to(self.device)
             
-            # Apply transform
-            single_point = self._apply_transform(single_point)
+            # Run Concerto
+            output = self.concerto(point_dict)
             
-            # Move to device and add batch dimension handling
-            for key in single_point:
-                if isinstance(single_point[key], np.ndarray):
-                    single_point[key] = torch.from_numpy(single_point[key]).to(self.device)
-            
-            # Run through Concerto
-            with torch.no_grad():
-                output = self.model(single_point)
-            
-            # Get features and reshape to image space
-            # Concerto outputs per-point features that we project back to 2D
-            point_features = output.get("feat", output)  # [N, D]
-            if isinstance(point_features, torch.Tensor):
-                # Reshape to image space
-                features_2d = point_features.reshape(H, W, -1)
-                all_features.append(features_2d)
+            # Get features
+            if isinstance(output, dict):
+                feat = output.get("feat", output.get("features"))
             else:
-                all_features.append(torch.randn(H, W, self.output_dim, device=self.device))
+                feat = output
+            
+            # Reshape to image space [H, W, D]
+            if feat is not None and isinstance(feat, torch.Tensor):
+                feat = feat.reshape(H, W, -1)
+            else:
+                feat = torch.randn(H, W, self.output_dim, device=self.device)
+            
+            all_features.append(feat)
         
         return torch.stack(all_features, dim=0)  # [B, H, W, D]
-    
-    def encode_video_pair(
-        self,
-        video: torch.Tensor,  # [B, C, 2, H, W]
-        depth: Optional[torch.Tensor] = None,  # [B, 2, H, W]
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Encode a pair of video frames.
-        
-        Args:
-            video: Two consecutive frames [B, C, 2, H, W]
-            depth: Optional depth maps [B, 2, H, W]
-            
-        Returns:
-            features_t0: Features of first frame [B, H, W, D]
-            features_t1: Features of second frame [B, H, W, D]
-        """
-        B, C, T, H, W = video.shape
-        assert T == 2, "Expected exactly 2 frames"
-        
-        frame_t0 = video[:, :, 0]  # [B, C, H, W]
-        frame_t1 = video[:, :, 1]
-        
-        depth_t0 = depth[:, 0] if depth is not None else None
-        depth_t1 = depth[:, 1] if depth is not None else None
-        
-        features_t0 = self.encode_single_frame(frame_t0, depth_t0)
-        features_t1 = self.encode_single_frame(frame_t1, depth_t1)
-        
-        return features_t0, features_t1
     
     def forward(
         self,
         video: torch.Tensor,  # [B, C, 2, H, W]
-        depth: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Forward pass encoding video frames.
+        Encode video frames to Concerto features.
         
         Args:
             video: Two consecutive frames [B, C, 2, H, W]
-            depth: Optional depth maps [B, 2, H, W]
             
         Returns:
-            features: Stacked features [B, 2, H, W, D]
+            features: [B, 2, H, W, D] Concerto features for both frames
         """
-        features_t0, features_t1 = self.encode_video_pair(video, depth)
-        return torch.stack([features_t0, features_t1], dim=1)  # [B, 2, H, W, D]
-
-
-class ConcertoFeatureCache:
-    """
-    Cache for pre-computed Concerto features.
-    
-    Useful for datasets where we want to pre-compute features offline
-    and load them during training for faster iteration.
-    """
-    
-    def __init__(self, cache_dir: str):
-        self.cache_dir = cache_dir
-        import os
-        os.makedirs(cache_dir, exist_ok=True)
-    
-    def get_cache_path(self, video_path: str, frame_idx: int) -> str:
-        """Get cache file path for a specific frame."""
-        import os
-        import hashlib
+        B, C, T, H, W = video.shape
+        assert T == 2, "Expected exactly 2 frames"
         
-        # Create unique key from video path and frame index
-        key = f"{video_path}_{frame_idx}"
-        hash_key = hashlib.md5(key.encode()).hexdigest()[:16]
-        return os.path.join(self.cache_dir, f"{hash_key}.pt")
+        # Encode each frame separately (for dynamic scenes)
+        features_t0 = self.encode_single_frame(video[:, :, 0])
+        features_t1 = self.encode_single_frame(video[:, :, 1])
+        
+        return torch.stack([features_t0, features_t1], dim=1)
+
+
+class VideoFrameExtractor:
+    """
+    Utility to extract frames from video files (.webm, .mp4, etc.)
+    """
     
-    def has_cached(self, video_path: str, frame_idx: int) -> bool:
-        """Check if features are cached."""
-        import os
-        return os.path.exists(self.get_cache_path(video_path, frame_idx))
+    def __init__(self, video_path: str):
+        self.video_path = video_path
+        self.cap = None
+        self._open_video()
     
-    def save(self, features: torch.Tensor, video_path: str, frame_idx: int):
-        """Save features to cache."""
-        cache_path = self.get_cache_path(video_path, frame_idx)
-        torch.save(features.cpu(), cache_path)
+    def _open_video(self):
+        """Open video file with OpenCV."""
+        try:
+            import cv2
+            self.cap = cv2.VideoCapture(self.video_path)
+            self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            print(f"Opened video: {self.video_path}")
+            print(f"  Frames: {self.frame_count}, FPS: {self.fps}, Size: {self.width}x{self.height}")
+        except ImportError:
+            print("Warning: OpenCV not installed. Install with: pip install opencv-python")
+            self.cap = None
     
-    def load(self, video_path: str, frame_idx: int, device: str = "cuda") -> torch.Tensor:
-        """Load features from cache."""
-        cache_path = self.get_cache_path(video_path, frame_idx)
-        return torch.load(cache_path, map_location=device)
+    def get_frame(self, frame_idx: int) -> Optional[np.ndarray]:
+        """
+        Get a specific frame from the video.
+        
+        Args:
+            frame_idx: Frame index (0-based)
+            
+        Returns:
+            RGB numpy array [H, W, 3] or None if failed
+        """
+        if self.cap is None:
+            return None
+        
+        import cv2
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = self.cap.read()
+        
+        if ret:
+            # Convert BGR to RGB
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return None
+    
+    def get_frame_pair(
+        self, 
+        first_idx: int, 
+        offset: int = 5,
+        target_size: Tuple[int, int] = (256, 256),
+    ) -> Optional[torch.Tensor]:
+        """
+        Get a pair of frames as a tensor.
+        
+        Args:
+            first_idx: Index of first frame
+            offset: Frame offset for second frame
+            target_size: (H, W) to resize to
+            
+        Returns:
+            Tensor [C, 2, H, W] or None if failed
+        """
+        import cv2
+        
+        frame1 = self.get_frame(first_idx)
+        frame2 = self.get_frame(min(first_idx + offset, self.frame_count - 1))
+        
+        if frame1 is None or frame2 is None:
+            return None
+        
+        # Resize
+        frame1 = cv2.resize(frame1, target_size[::-1])  # cv2 uses (W, H)
+        frame2 = cv2.resize(frame2, target_size[::-1])
+        
+        # Convert to tensor [C, H, W] in [0, 1] range
+        frame1 = torch.from_numpy(frame1).permute(2, 0, 1).float() / 255.0
+        frame2 = torch.from_numpy(frame2).permute(2, 0, 1).float() / 255.0
+        
+        # Stack as [C, 2, H, W]
+        return torch.stack([frame1, frame2], dim=1)
+    
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+    
+    def __del__(self):
+        self.close()
+
+
+# Legacy classes for backward compatibility
+class DepthEstimator(nn.Module):
+    """Legacy depth estimator - now handled by VGGT."""
+    
+    def __init__(self, model_type: str = "vggt", device: str = "cuda"):
+        super().__init__()
+        print("Note: DepthEstimator is deprecated. Using VGGT for depth estimation.")
+        self.vggt = VGGTEncoder(device=device) if model_type == "vggt" else None
+    
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
+        if self.vggt is not None:
+            results = self.vggt.encode_single_frame(images)
+            return results['depth_map']
+        return torch.ones(images.shape[0], images.shape[2], images.shape[3])
+
+
+class PointCloudLifter(nn.Module):
+    """Legacy point cloud lifter - now handled by VGGT."""
+    
+    def __init__(self, **kwargs):
+        super().__init__()
+        print("Note: PointCloudLifter is deprecated. Using VGGT for point cloud generation.")
+    
+    def forward(self, rgb, depth, **kwargs):
+        print("Warning: Using legacy PointCloudLifter. Consider using VGGTEncoder instead.")
+        B, C, H, W = rgb.shape
+        
+        # Simple back-projection with default intrinsics
+        fx = fy = 500.0
+        cx, cy = W / 2, H / 2
+        
+        u = torch.arange(W, device=rgb.device).float()
+        v = torch.arange(H, device=rgb.device).float()
+        u, v = torch.meshgrid(u, v, indexing='xy')
+        
+        z = depth
+        x = (u.unsqueeze(0) - cx) * z / fx
+        y = (v.unsqueeze(0) - cy) * z / fy
+        
+        coords = torch.stack([x, y, z], dim=-1)
+        colors = rgb.permute(0, 2, 3, 1)
+        
+        return {
+            "coord": coords,
+            "color": colors,
+        }
