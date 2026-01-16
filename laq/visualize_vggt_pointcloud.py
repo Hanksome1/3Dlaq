@@ -169,19 +169,48 @@ def test_vggt_real(video_path: str, output_dir: str, frame_idx: int = 0):
     
     print("✓ VGGT inference completed!")
     
-    # Extract results (remove batch dimensions)
-    depth = depth_map[0, 0].cpu().numpy()  # [H, W]
-    points = point_map[0, 0].cpu().numpy()  # [H, W, 3]
-    confidence = point_conf[0, 0].cpu().numpy()  # [H, W]
-    intrinsic_mat = intrinsic[0, 0].cpu().numpy()  # [3, 3]
-    extrinsic_mat = extrinsic[0, 0].cpu().numpy()  # [4, 4]
+    # Debug: print raw shapes
+    print(f"\n  Raw output shapes:")
+    print(f"    depth_map: {depth_map.shape}")
+    print(f"    point_map: {point_map.shape}")
+    print(f"    point_conf: {point_conf.shape}")
+    print(f"    intrinsic: {intrinsic.shape}")
+    print(f"    extrinsic: {extrinsic.shape}")
     
-    H, W = depth.shape
+    # Extract results - handle various possible shapes
+    # depth_map could be [B, N, H, W] or [B, H, W] etc.
+    depth_np = depth_map.cpu().numpy()
+    points_np = point_map.cpu().numpy()
+    conf_np = point_conf.cpu().numpy()
     
-    print(f"\nResults:")
-    print(f"  Depth map: {depth.shape}, range [{depth.min():.3f}, {depth.max():.3f}]")
-    print(f"  Point map: {points.shape}")
-    print(f"  Confidence: {confidence.shape}, range [{confidence.min():.3f}, {confidence.max():.3f}]")
+    # Squeeze all batch/extra dimensions to get [H, W] for depth, [H, W, 3] for points
+    while depth_np.ndim > 2:
+        depth_np = depth_np[0]
+    while points_np.ndim > 3:
+        points_np = points_np[0]
+    while conf_np.ndim > 2:
+        conf_np = conf_np[0]
+    
+    depth = depth_np
+    points = points_np
+    confidence = conf_np
+    
+    # Same for camera params
+    intrinsic_np = intrinsic.cpu().numpy()
+    extrinsic_np = extrinsic.cpu().numpy()
+    while intrinsic_np.ndim > 2:
+        intrinsic_np = intrinsic_np[0]
+    while extrinsic_np.ndim > 2:
+        extrinsic_np = extrinsic_np[0]
+    intrinsic_mat = intrinsic_np
+    extrinsic_mat = extrinsic_np
+    
+    H, W = depth.shape[:2]
+    
+    print(f"\n  Extracted shapes:")
+    print(f"    depth: {depth.shape}, range [{depth.min():.3f}, {depth.max():.3f}]")
+    print(f"    points: {points.shape}")
+    print(f"    confidence: {confidence.shape}")
     print(f"\n  Camera intrinsics:")
     print(f"    fx={intrinsic_mat[0,0]:.2f}, fy={intrinsic_mat[1,1]:.2f}")
     print(f"    cx={intrinsic_mat[0,2]:.2f}, cy={intrinsic_mat[1,2]:.2f}")
