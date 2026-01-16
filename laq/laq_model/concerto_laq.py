@@ -21,7 +21,7 @@ from typing import Optional, Tuple, Dict, Union
 from einops import rearrange, repeat
 
 from laq_model.attention import Transformer, ContinuousPositionBias
-from laq_model.concerto_wrapper import ConcertoEncoder, DepthEstimator
+from laq_model.concerto_wrapper import ConcertoEncoder
 from laq_model.latent_nsvq import LatentSpaceNSVQ
 
 
@@ -167,15 +167,16 @@ class ConcertoLAQ(nn.Module):
         
         # Concerto encoder (frozen by default)
         if not use_precomputed_features:
-            self.depth_estimator = DepthEstimator(model_type=depth_model_type) if use_depth else None
             self.concerto = ConcertoEncoder(
-                model_name=concerto_model_name,
-                freeze=freeze_concerto,
-                depth_estimator=self.depth_estimator,
+                concerto_model_name=concerto_model_name,
+                freeze_concerto=freeze_concerto,
+                device="cuda" if torch.cuda.is_available() else "cpu",
             )
+            self.depth_estimator = self.concerto.vggt  # VGGT handles depth internally
         else:
             self.concerto = None
             self.depth_estimator = None
+
         
         # Feature projection: Concerto dim -> model dim
         self.feature_proj = nn.Sequential(
@@ -240,14 +241,17 @@ class ConcertoLAQ(nn.Module):
     def extract_features(
         self,
         video: torch.Tensor,  # [B, C, 2, H, W]
-        depth: Optional[torch.Tensor] = None,  # [B, 2, H, W]
+        depth: Optional[torch.Tensor] = None,  # [B, 2, H, W] (ignored, VGGT handles internally)
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Extract Concerto features from video frames.
         
+        Note: depth parameter is kept for API compatibility but is ignored.
+        VGGT handles depth estimation internally.
+        
         Args:
             video: Two consecutive RGB frames
-            depth: Optional depth maps
+            depth: Ignored (kept for API compatibility)
             
         Returns:
             features_t0: [B, H', W', concerto_dim]
@@ -257,16 +261,18 @@ class ConcertoLAQ(nn.Module):
             raise ValueError("Concerto encoder not initialized. Use use_precomputed_features=False")
         
         # Extract features using Concerto (frozen)
+        # VGGT handles depth estimation internally
         if self.freeze_concerto:
             with torch.no_grad():
-                features = self.concerto(video, depth)  # [B, 2, H', W', D]
+                features = self.concerto(video)  # [B, 2, H', W', D]
         else:
-            features = self.concerto(video, depth)
+            features = self.concerto(video)
         
         features_t0 = features[:, 0]
         features_t1 = features[:, 1]
         
         return features_t0, features_t1
+
     
     def encode_features(
         self,
