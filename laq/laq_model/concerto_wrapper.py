@@ -301,8 +301,9 @@ class ConcertoEncoder(nn.Module):
         Concerto expects a dict with:
         - coord: [N, 3] point coordinates
         - color: [N, 3] normalized colors (0-1)
+        - normal: [N, 3] surface normals (we use dummy zeros)
         - grid_coord: [N, 3] grid coordinates (for sparse conv)
-        - feat: [N, C] input features (usually coord + color)
+        - feat: [N, 9] input features (coord + color + normal)
         
         Args:
             point_map: 3D coordinates [B, H, W, 3]
@@ -319,25 +320,26 @@ class ConcertoEncoder(nn.Module):
         batch_points = []
         for b in range(B):
             # Flatten spatial dimensions
-            coord = point_map[b].reshape(-1, 3).cpu()  # [N, 3]
-            color = colors_hwc[b].reshape(-1, 3).cpu()  # [N, 3]
+            coord = point_map[b].reshape(-1, 3).cpu().float()  # [N, 3]
+            color = colors_hwc[b].reshape(-1, 3).cpu().float()  # [N, 3]
+            
+            # Create dummy normals (zeros) since VGGT doesn't provide them
+            normal = torch.zeros_like(coord)  # [N, 3]
             
             # Center the point cloud
             coord = coord - coord.mean(dim=0)
             
             # Grid sampling (voxelization)
-            # This is a simplified version - Concerto's GridSample is more complex
             grid_coord = torch.floor(coord / self.grid_size).int()
             
-            # Create unique grid indices for sparse conv
-            # Just use the raw grid coord for now
-            
             # Prepare the dict in Concerto's expected format
+            # feat should be 9-dim: coord (3) + color (3) + normal (3)
             point_dict = {
                 "coord": coord,  # [N, 3] float tensor
                 "grid_coord": grid_coord,  # [N, 3] int tensor
                 "color": color,  # [N, 3] float tensor  
-                "feat": torch.cat([coord, color], dim=1),  # [N, 6] combined features
+                "normal": normal,  # [N, 3] float tensor
+                "feat": torch.cat([coord, color, normal], dim=1),  # [N, 9] combined features
                 "offset": torch.tensor([coord.shape[0]], dtype=torch.int64),  # batch offset
             }
             
