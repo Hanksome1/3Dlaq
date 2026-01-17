@@ -449,33 +449,58 @@ class ConcertoLAQ(nn.Module):
         # Compute losses
         reconstruction_loss = F.mse_loss(predicted_t1, encoded_t1.detach())
         
-        # Get commitment loss from the quantizer
-        commitment_loss = torch.tensor(0.0, device=reconstruction_loss.device)
-        if hasattr(self, 'action_quantizer') and hasattr(self.action_quantizer, 'quantizer'):
-            if hasattr(self.action_quantizer.quantizer, 'commitment_loss'):
-                commitment_loss = self.action_quantizer.quantizer.commitment_loss
-        
-        # Entropy regularization to encourage codebook diversity
-        # Compute probability distribution over codebook usage
+        # ===== Diversity regularization to prevent codebook collapse =====
         flat_indices = indices.view(-1)
+        batch_unique = flat_indices.unique()
+        num_unique_indices = batch_unique.size(0)
+        
+        # 1. Entropy-based diversity loss (batch level)
         counts = torch.bincount(flat_indices, minlength=self.codebook_size).float()
         probs = counts / (counts.sum() + 1e-8)
-        
-        # Compute entropy (higher = more diverse usage)
         entropy = -(probs * torch.log(probs + 1e-8)).sum()
         max_entropy = torch.log(torch.tensor(float(self.codebook_size), device=entropy.device))
-        normalized_entropy = entropy / max_entropy  # 0 to 1, higher is better
+        normalized_entropy = entropy / max_entropy
+        entropy_loss = 1.0 - normalized_entropy
         
-        # Entropy loss: penalize low entropy (low diversity)
-        entropy_loss = 1.0 - normalized_entropy  # Want to minimize this (maximize entropy)
+        # 2. Codebook spread loss: encourage codebook vectors to be spread out
+        # This prevents multiple similar codebook entries
+        if hasattr(self, 'action_quantizer'):
+            codebook = self.action_quantizer.codebooks  # [K, D]
+            K, D = codebook.shape
+            
+            # Compute pairwise distances between codebook entries
+            codebook_norm = codebook / (codebook.norm(dim=1, keepdim=True) + 1e-8)
+            similarity_matrix = torch.mm(codebook_norm, codebook_norm.t())  # [K, K]
+            
+            # Mask out diagonal (self-similarity)
+            mask = torch.eye(K, device=similarity_matrix.device).bool()
+            similarity_matrix = similarity_matrix.masked_fill(mask, -1)
+            
+            # Penalize high similarity between different codebook entries
+            # We want codebook entries to be diverse (low similarity)
+            max_similarity = similarity_matrix.max(dim=1)[0].mean()  # Average max similarity
+            spread_loss = max_similarity + 1.0  # Range [0, 2], want to minimize
+        else:
+            spread_loss = torch.tensor(0.0, device=reconstruction_loss.device)
         
-        # Total loss with stronger regularization
-        # Increased commitment loss weight: 0.25 -> 1.0
-        # Added entropy loss with weight 0.5
-        commitment_weight = 1.0  # Stronger commitment
-        entropy_weight = 0.5     # Encourage diversity
+        # 3. Usage balance loss: penalize if some codes are used way more than others
+        if num_unique_indices > 1:
+            usage_variance = probs[probs > 0].var()
+            balance_loss = usage_variance * 10.0  # Scale up
+        else:
+            balance_loss = torch.tensor(1.0, device=reconstruction_loss.device)  # Penalize single code
         
-        total_loss = reconstruction_loss + commitment_weight * commitment_loss + entropy_weight * entropy_loss
+        # Total loss with strong diversity enforcement
+        entropy_weight = 2.0      # Strong entropy regularization
+        spread_weight = 0.5       # Codebook spread regularization
+        balance_weight = 0.1      # Usage balance
+        
+        total_loss = (
+            reconstruction_loss 
+            + entropy_weight * entropy_loss 
+            + spread_weight * spread_loss
+            + balance_weight * balance_loss
+        )
         
         # Compute codebook utilization rate
         codebook_utilization = num_unique_indices / self.codebook_size
@@ -484,8 +509,9 @@ class ConcertoLAQ(nn.Module):
         metrics = {
             'loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
-            'commitment_loss': commitment_loss,
             'entropy_loss': entropy_loss,
+            'spread_loss': spread_loss,
+            'balance_loss': balance_loss,
             'entropy': entropy,
             'num_unique_codes': num_unique_indices,
             'codebook_utilization': codebook_utilization,
