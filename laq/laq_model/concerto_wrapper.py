@@ -477,19 +477,28 @@ class ConcertoEncoder(nn.Module):
                 all_features.append(feat)
                 continue
             
-            # Get features
+            # Get features from Concerto output
             if isinstance(output, dict):
                 feat = output.get("feat", output.get("features"))
             else:
                 feat = output
             
-            # Reshape to image space and downsample
+            # Handle subsampled point cloud output
+            # Concerto returns [N', D] where N' is the number of downsampled points
             if feat is not None and isinstance(feat, torch.Tensor):
-                feat = feat.reshape(H, W, -1)  # [H, W, D]
-                # Downsample
-                feat = feat.permute(2, 0, 1).unsqueeze(0)  # [1, D, H, W]
-                feat = F.interpolate(feat, size=(target_h, target_w), mode='bilinear', align_corners=False)
-                feat = feat.squeeze(0).permute(1, 2, 0)  # [H', W', D]
+                N_out, D = feat.shape
+                
+                # Since we subsampled the point cloud, we can't reshape to H×W
+                # Instead, we'll pool the features and reshape to target grid
+                # Option 1: Simple reshape to sqrt(N) × sqrt(N) grid
+                # Option 2: Global average pooling + tile to grid
+                
+                # Use option 2: Pool to get global feature, then expand to grid
+                # This is simpler and more robust
+                global_feat = feat.mean(dim=0)  # [D] - global pooling
+                
+                # Expand to target grid
+                feat = global_feat.view(1, 1, D).expand(target_h, target_w, D)  # [H', W', D]
             else:
                 feat = torch.randn(target_h, target_w, self.output_dim, device=self.device)
             
