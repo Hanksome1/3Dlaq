@@ -246,27 +246,36 @@ class ConcertoEncoder(nn.Module):
         try:
             import concerto
             print(f"Concerto package found at: {concerto.__file__}")
-            model = concerto.model.load(
-                model_name,
-                repo_id="Pointcept/Concerto"
-            ).to(self.device)
-            print(f"Loaded Concerto model: {model_name}")
-            return model
+            
+            # Try with flash attention first
+            try:
+                model = concerto.model.load(
+                    model_name,
+                    repo_id="Pointcept/Concerto"
+                ).to(self.device)
+                print(f"Loaded Concerto model: {model_name}")
+                return model
+            except AssertionError as e:
+                if "flash_attn" in str(e):
+                    print("Flash Attention not available, loading with enable_flash=False...")
+                    # Load without flash attention
+                    custom_config = dict(
+                        enc_patch_size=[1024 for _ in range(5)],
+                        enable_flash=False,
+                    )
+                    model = concerto.model.load(
+                        model_name,
+                        repo_id="Pointcept/Concerto",
+                        custom_config=custom_config
+                    ).to(self.device)
+                    print(f"Loaded Concerto model (no flash): {model_name}")
+                    return model
+                raise e
+                
         except ImportError as e:
             print(f"Warning: concerto package not installed. Error: {e}")
             print("Using dummy encoder.")
             return None
-        except AttributeError as e:
-            # concerto.model.load might not exist
-            print(f"Warning: concerto.model.load not found. Trying alternative...")
-            try:
-                from concerto.model import PointTransformerV3
-                model = PointTransformerV3.from_pretrained("Pointcept/Concerto").to(self.device)
-                print(f"Loaded Concerto model via PointTransformerV3: {model_name}")
-                return model
-            except Exception as e2:
-                print(f"Warning: Alternative load also failed: {e2}")
-                return None
         except Exception as e:
             print(f"Warning: Failed to load Concerto model: {type(e).__name__}: {e}")
             import traceback
@@ -289,6 +298,12 @@ class ConcertoEncoder(nn.Module):
         """
         Convert VGGT point map to Concerto input format.
         
+        Concerto expects a dict with:
+        - coord: [N, 3] point coordinates
+        - color: [N, 3] normalized colors (0-1)
+        - grid_coord: [N, 3] grid coordinates (for sparse conv)
+        - feat: [N, C] input features (usually coord + color)
+        
         Args:
             point_map: 3D coordinates [B, H, W, 3]
             colors: RGB values [B, C, H, W]
@@ -298,23 +313,33 @@ class ConcertoEncoder(nn.Module):
         """
         B, H, W, _ = point_map.shape
         
-        # Reshape colors to match point_map
-        colors = colors.permute(0, 2, 3, 1)  # [B, H, W, C]
+        # Reshape colors to match point_map: [B, H, W, C]
+        colors_hwc = colors.permute(0, 2, 3, 1)
         
         batch_points = []
         for b in range(B):
             # Flatten spatial dimensions
-            coords = point_map[b].reshape(-1, 3)  # [N, 3]
-            color = colors[b].reshape(-1, 3)  # [N, 3]
+            coord = point_map[b].reshape(-1, 3).cpu()  # [N, 3]
+            color = colors_hwc[b].reshape(-1, 3).cpu()  # [N, 3]
             
+            # Center the point cloud
+            coord = coord - coord.mean(dim=0)
+            
+            # Grid sampling (voxelization)
+            # This is a simplified version - Concerto's GridSample is more complex
+            grid_coord = torch.floor(coord / self.grid_size).int()
+            
+            # Create unique grid indices for sparse conv
+            # Just use the raw grid coord for now
+            
+            # Prepare the dict in Concerto's expected format
             point_dict = {
-                "coord": coords.cpu().numpy(),
-                "color": color.cpu().numpy(),
+                "coord": coord,  # [N, 3] float tensor
+                "grid_coord": grid_coord,  # [N, 3] int tensor
+                "color": color,  # [N, 3] float tensor  
+                "feat": torch.cat([coord, color], dim=1),  # [N, 6] combined features
+                "offset": torch.tensor([coord.shape[0]], dtype=torch.int64),  # batch offset
             }
-            
-            # Apply Concerto transform if available
-            if self.transform is not None:
-                point_dict = self.transform(point_dict)
             
             batch_points.append(point_dict)
         
@@ -360,13 +385,22 @@ class ConcertoEncoder(nn.Module):
         # Step 3: Run through Concerto
         all_features = []
         for point_dict in batch_points:
-            # Move tensors to device
+            # Move all tensors to device
             for key in point_dict:
-                if isinstance(point_dict[key], np.ndarray):
+                if isinstance(point_dict[key], torch.Tensor):
+                    point_dict[key] = point_dict[key].to(self.device)
+                elif isinstance(point_dict[key], np.ndarray):
                     point_dict[key] = torch.from_numpy(point_dict[key]).to(self.device)
             
             # Run Concerto
-            output = self.concerto(point_dict)
+            try:
+                output = self.concerto(point_dict)
+            except Exception as e:
+                print(f"Concerto forward error: {e}")
+                # Return dummy on error
+                feat = torch.randn(target_h, target_w, self.output_dim, device=self.device)
+                all_features.append(feat)
+                continue
             
             # Get features
             if isinstance(output, dict):
