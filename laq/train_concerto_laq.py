@@ -47,8 +47,8 @@ def parse_args():
                         help="Directory containing .webm video files")
     parser.add_argument("--max_videos", type=int, default=None,
                         help="Limit number of videos (for testing)")
-    parser.add_argument("--frame_size", type=int, default=256,
-                        help="Frame size (must be divisible by 14)")
+    parser.add_argument("--frame_size", type=int, default=224,
+                        help="Frame size (must be divisible by 14 for VGGT)")
     parser.add_argument("--frame_offset", type=int, default=30,
                         help="Frame offset between pairs (LAQ uses 30)")
     parser.add_argument("--samples_per_video", type=int, default=1,
