@@ -383,9 +383,9 @@ class ConcertoEncoder(nn.Module):
             
             N = coord.shape[0]
             
-            # Subsample if too many points using Farthest Point Sampling (FPS)
+            # Subsample if too many points (use random for now, can switch to FPS later)
             if N > max_points:
-                indices = self._fps_subsample(coord, max_points)
+                indices = torch.randperm(N)[:max_points]
                 coord = coord[indices]
                 color = color[indices]
             
