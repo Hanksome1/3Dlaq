@@ -231,7 +231,7 @@ def main():
         
         # Forward pass
         try:
-            loss, num_unique = model(video=video, step=step)
+            loss, num_unique, metrics = model(video=video, step=step)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"Warning: OOM at step {step}, skipping batch")
@@ -253,32 +253,58 @@ def main():
         running_loss += loss.item() * args.grad_accum
         running_unique += num_unique
         
+        # Accumulate metrics
+        if 'running_metrics' not in locals():
+            running_metrics = {k: 0.0 for k in metrics.keys() if isinstance(metrics[k], (int, float, torch.Tensor))}
+        for k, v in metrics.items():
+            if k in running_metrics:
+                running_metrics[k] += v.item() if isinstance(v, torch.Tensor) else v
+        
         # Logging
         if (step + 1) % args.log_every == 0:
             avg_loss = running_loss / args.log_every
             avg_unique = running_unique / args.log_every
             lr = scheduler.get_last_lr()[0]
             
+            # Compute average metrics
+            avg_metrics = {k: v / args.log_every for k, v in running_metrics.items()}
+            
             print(f"Step {step+1}/{args.num_steps} | "
                   f"Loss: {avg_loss:.4f} | "
-                  f"Unique codes: {avg_unique:.1f} | "
+                  f"Recon: {avg_metrics.get('reconstruction_loss', 0):.4f} | "
+                  f"Entropy: {avg_metrics.get('entropy', 0):.2f} | "
+                  f"Unique: {avg_unique:.1f} | "
+                  f"Util: {avg_metrics.get('codebook_utilization', 0):.2%} | "
                   f"LR: {lr:.2e}")
             
             if args.use_wandb:
                 wandb.log({
                     "loss": avg_loss,
+                    "reconstruction_loss": avg_metrics.get('reconstruction_loss', 0),
+                    "commitment_loss": avg_metrics.get('commitment_loss', 0),
+                    "entropy_loss": avg_metrics.get('entropy_loss', 0),
+                    "entropy": avg_metrics.get('entropy', 0),
                     "unique_codes": avg_unique,
+                    "codebook_utilization": avg_metrics.get('codebook_utilization', 0),
+                    "perplexity": avg_metrics.get('perplexity', 0),
                     "lr": lr,
                 }, step=step+1)
             
             # TensorBoard logging
             if tb_writer is not None:
                 tb_writer.add_scalar("train/loss", avg_loss, step+1)
+                tb_writer.add_scalar("train/reconstruction_loss", avg_metrics.get('reconstruction_loss', 0), step+1)
+                tb_writer.add_scalar("train/commitment_loss", avg_metrics.get('commitment_loss', 0), step+1)
+                tb_writer.add_scalar("train/entropy_loss", avg_metrics.get('entropy_loss', 0), step+1)
+                tb_writer.add_scalar("train/entropy", avg_metrics.get('entropy', 0), step+1)
                 tb_writer.add_scalar("train/unique_codes", avg_unique, step+1)
+                tb_writer.add_scalar("train/codebook_utilization", avg_metrics.get('codebook_utilization', 0), step+1)
+                tb_writer.add_scalar("train/perplexity", avg_metrics.get('perplexity', 0), step+1)
                 tb_writer.add_scalar("train/learning_rate", lr, step+1)
             
             running_loss = 0.0
             running_unique = 0.0
+            running_metrics = {k: 0.0 for k in metrics.keys() if isinstance(metrics[k], (int, float, torch.Tensor))}
         
         # Save checkpoint
         if (step + 1) % args.save_every == 0:

@@ -445,10 +445,52 @@ class ConcertoLAQ(nn.Module):
         if return_recons_only:
             return predicted_t1
         
-        # Compute loss: MSE between predicted and actual next frame features
-        loss = F.mse_loss(predicted_t1, encoded_t1.detach())
+        # Compute losses
+        reconstruction_loss = F.mse_loss(predicted_t1, encoded_t1.detach())
         
-        return loss, num_unique_indices
+        # Get commitment loss from the quantizer
+        commitment_loss = torch.tensor(0.0, device=reconstruction_loss.device)
+        if hasattr(self.action_encoder, 'quantizer') and hasattr(self.action_encoder.quantizer, 'commitment_loss'):
+            commitment_loss = self.action_encoder.quantizer.commitment_loss
+        
+        # Entropy regularization to encourage codebook diversity
+        # Compute probability distribution over codebook usage
+        flat_indices = indices.view(-1)
+        counts = torch.bincount(flat_indices, minlength=self.codebook_size).float()
+        probs = counts / (counts.sum() + 1e-8)
+        
+        # Compute entropy (higher = more diverse usage)
+        entropy = -(probs * torch.log(probs + 1e-8)).sum()
+        max_entropy = torch.log(torch.tensor(float(self.codebook_size), device=entropy.device))
+        normalized_entropy = entropy / max_entropy  # 0 to 1, higher is better
+        
+        # Entropy loss: penalize low entropy (low diversity)
+        entropy_loss = 1.0 - normalized_entropy  # Want to minimize this (maximize entropy)
+        
+        # Total loss with stronger regularization
+        # Increased commitment loss weight: 0.25 -> 1.0
+        # Added entropy loss with weight 0.5
+        commitment_weight = 1.0  # Stronger commitment
+        entropy_weight = 0.5     # Encourage diversity
+        
+        total_loss = reconstruction_loss + commitment_weight * commitment_loss + entropy_weight * entropy_loss
+        
+        # Compute codebook utilization rate
+        codebook_utilization = num_unique_indices / self.codebook_size
+        
+        # Build metrics dictionary
+        metrics = {
+            'loss': total_loss,
+            'reconstruction_loss': reconstruction_loss,
+            'commitment_loss': commitment_loss,
+            'entropy_loss': entropy_loss,
+            'entropy': entropy,
+            'num_unique_codes': num_unique_indices,
+            'codebook_utilization': codebook_utilization,
+            'perplexity': perplexity.mean() if perplexity.numel() > 0 else torch.tensor(0.0),
+        }
+        
+        return total_loss, num_unique_indices, metrics
     
     def inference(
         self,
