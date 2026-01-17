@@ -24,6 +24,7 @@ from laq_model.attention import Transformer, ContinuousPositionBias
 from laq_model.concerto_wrapper import ConcertoEncoder
 from laq_model.latent_nsvq import LatentSpaceNSVQ
 from laq_model.vq_ema import LatentVQVAE
+from laq_model.gumbel_vq import GumbelLatentVQ
 
 
 def exists(val):
@@ -155,7 +156,8 @@ class ConcertoLAQ(nn.Module):
         use_depth: bool = True,
         depth_model_type: str = "dummy",
         use_precomputed_features: bool = False,
-        use_ema_vq: bool = True,  # Use VQ-EMA instead of NSVQ
+        use_ema_vq: bool = False,  # Deprecated, use vq_type instead
+        vq_type: str = "gumbel",   # "nsvq", "ema", or "gumbel"
     ):
         super().__init__()
         
@@ -167,6 +169,12 @@ class ConcertoLAQ(nn.Module):
         self.codebook_size = codebook_size
         self.use_precomputed_features = use_precomputed_features
         self.freeze_concerto = freeze_concerto
+        self.vq_type = vq_type
+        
+        # Handle deprecated use_ema_vq parameter
+        if use_ema_vq and vq_type == "gumbel":
+            vq_type = "ema"
+            self.vq_type = vq_type
         
         # Concerto encoder (frozen by default)
         if not use_precomputed_features:
@@ -208,10 +216,21 @@ class ConcertoLAQ(nn.Module):
         # Temporal difference encoder - process the delta between frames
         self.temporal_encoder = Transformer(depth=temporal_depth, **transformer_kwargs)
         
-        # Action quantizer - choose between NSVQ and VQ-EMA
-        self.use_ema_vq = use_ema_vq
-        if use_ema_vq:
-            # VQ-EMA: More stable for low-dimensional latent spaces
+        # Action quantizer - choose between NSVQ, VQ-EMA, and Gumbel-VQ
+        print(f"Using VQ type: {vq_type}")
+        if vq_type == "gumbel":
+            # Gumbel-Softmax: Best for preventing codebook collapse
+            self.action_quantizer = GumbelLatentVQ(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+                temperature_init=2.0,
+                temperature_min=0.5,
+            )
+        elif vq_type == "ema":
+            # VQ-EMA: More stable than NSVQ
             self.action_quantizer = LatentVQVAE(
                 input_dim=dim,
                 embedding_dim=quant_dim,
@@ -357,8 +376,8 @@ class ConcertoLAQ(nn.Module):
         encoded_delta = rearrange(encoded_delta, 'b (h w) d -> b h w d', h=H, w=W)
         
         # Quantize to action codes
-        if self.use_ema_vq:
-            # VQ-EMA returns: (decoded, perplexity, commitment_loss, indices)
+        if self.vq_type in ["gumbel", "ema"]:
+            # Both Gumbel and VQ-EMA return: (decoded, perplexity, commitment_loss, indices)
             decoded_delta, perplexity, commitment_loss, indices = self.action_quantizer(
                 features_t0, features_t1
             )
@@ -541,6 +560,10 @@ class ConcertoLAQ(nn.Module):
             'codebook_utilization': codebook_utilization,
             'perplexity': perplexity.mean() if perplexity.numel() > 0 else torch.tensor(0.0),
         }
+        
+        # Add temperature for Gumbel VQ
+        if self.vq_type == "gumbel" and hasattr(self.action_quantizer, 'temperature'):
+            metrics['temperature'] = self.action_quantizer.temperature
         
         return total_loss, num_unique_indices, metrics
     
