@@ -131,11 +131,12 @@ def main():
     print("Creating Model")
     print("="*60)
     
-    # Concerto output dim
+    # Concerto output dim (PTv3 features)
+    # Based on Concerto model configs
     concerto_dims = {
-        "concerto_small": 256,
-        "concerto_base": 256,
-        "concerto_large": 512,
+        "concerto_small": 512,  # PTv3-small outputs 512
+        "concerto_base": 512,   # PTv3-base outputs 512
+        "concerto_large": 512,  # PTv3-large outputs 512
     }
     
     model = ConcertoLAQ(
