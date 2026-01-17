@@ -294,6 +294,7 @@ class ConcertoEncoder(nn.Module):
         self,
         point_map: torch.Tensor,  # [B, H, W, 3]
         colors: torch.Tensor,  # [B, C, H, W]
+        max_points: int = 8192,  # Concerto works best with fewer points
     ) -> List[Dict]:
         """
         Convert VGGT point map to Concerto input format.
@@ -308,6 +309,7 @@ class ConcertoEncoder(nn.Module):
         Args:
             point_map: 3D coordinates [B, H, W, 3]
             colors: RGB values [B, C, H, W]
+            max_points: Maximum number of points (subsample if exceeded)
             
         Returns:
             List of point dictionaries for each batch item
@@ -322,6 +324,15 @@ class ConcertoEncoder(nn.Module):
             # Flatten spatial dimensions
             coord = point_map[b].reshape(-1, 3).cpu().float()  # [N, 3]
             color = colors_hwc[b].reshape(-1, 3).cpu().float()  # [N, 3]
+            
+            N = coord.shape[0]
+            
+            # Subsample if too many points
+            if N > max_points:
+                # Random subsampling
+                indices = torch.randperm(N)[:max_points]
+                coord = coord[indices]
+                color = color[indices]
             
             # Create dummy normals (zeros) since VGGT doesn't provide them
             normal = torch.zeros_like(coord)  # [N, 3]
