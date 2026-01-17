@@ -392,11 +392,16 @@ class ConcertoEncoder(nn.Module):
             # Create dummy normals (zeros) since VGGT doesn't provide them
             normal = torch.zeros_like(coord)  # [N, 3]
             
-            # Center the point cloud
+            # Center and normalize the point cloud to [-1, 1] range
+            # This is critical to avoid grid coordinate overflow
             coord = coord - coord.mean(dim=0)
+            coord_range = coord.abs().max() + 1e-6
+            coord = coord / coord_range  # Now in [-1, 1]
             
-            # Grid sampling (voxelization)
-            grid_coord = torch.floor(coord / self.grid_size).int()
+            # Grid sampling (voxelization) with normalized coordinates
+            # Use a grid that fits in reasonable range (e.g., 50x50x50)
+            grid_size = 0.04  # This gives ~50 bins per axis for [-1, 1] range
+            grid_coord = torch.floor((coord + 1) / grid_size).int()  # Shift to [0, 2] then bin
             
             # Prepare the dict in Concerto's expected format
             # feat should be 9-dim: coord (3) + color (3) + normal (3)
