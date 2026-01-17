@@ -162,6 +162,7 @@ class ConcertoLAQ(nn.Module):
         self.code_seq_len = code_seq_len
         self.dim = dim
         self.concerto_dim = concerto_dim
+        self.codebook_size = codebook_size
         self.use_precomputed_features = use_precomputed_features
         self.freeze_concerto = freeze_concerto
         
