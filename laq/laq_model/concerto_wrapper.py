@@ -238,6 +238,18 @@ class ConcertoEncoder(nn.Module):
         
         # Transform pipeline for Concerto
         self.transform = None
+        
+        # Sparse-to-dense projection for spatial feature mapping
+        # This replaces global pooling with learnable cross-attention
+        from .sparse_to_dense import SparseToDenseProjection
+        self.sparse_to_dense = SparseToDenseProjection(
+            point_dim=512,  # Concerto output is 512-dim
+            output_dim=512,
+            height=14,  # Target spatial size (224/16)
+            width=14,
+            num_heads=8,
+            num_layers=2,
+        ).to(device)
         self._setup_transform()
     
     def _load_concerto(self, model_name: str):
@@ -486,19 +498,10 @@ class ConcertoEncoder(nn.Module):
             # Handle subsampled point cloud output
             # Concerto returns [N', D] where N' is the number of downsampled points
             if feat is not None and isinstance(feat, torch.Tensor):
-                N_out, D = feat.shape
-                
-                # Since we subsampled the point cloud, we can't reshape to H×W
-                # Instead, we'll pool the features and reshape to target grid
-                # Option 1: Simple reshape to sqrt(N) × sqrt(N) grid
-                # Option 2: Global average pooling + tile to grid
-                
-                # Use option 2: Pool to get global feature, then expand to grid
-                # This is simpler and more robust
-                global_feat = feat.mean(dim=0)  # [D] - global pooling
-                
-                # Expand to target grid
-                feat = global_feat.view(1, 1, D).expand(target_h, target_w, D)  # [H', W', D]
+                # Use learnable sparse-to-dense projection
+                # This maps [N, D] point features to [H, W, D] dense feature map
+                # using cross-attention between spatial queries and point features
+                feat = self.sparse_to_dense(feat)  # [H', W', D]
             else:
                 feat = torch.randn(target_h, target_w, self.output_dim, device=self.device)
             
