@@ -290,6 +290,62 @@ class ConcertoEncoder(nn.Module):
         except ImportError:
             self.transform = None
     
+    def _fps_subsample(self, points: torch.Tensor, num_samples: int) -> torch.Tensor:
+        """
+        Farthest Point Sampling (FPS) for point cloud downsampling.
+        
+        Iteratively selects points that are farthest from already selected points,
+        ensuring good spatial coverage.
+        
+        Args:
+            points: [N, 3] point coordinates
+            num_samples: number of points to sample
+            
+        Returns:
+            indices: [num_samples] indices of selected points
+        """
+        N = points.shape[0]
+        
+        # Try to use PyTorch3D's FPS (faster GPU implementation)
+        try:
+            from pytorch3d.ops import sample_farthest_points
+            # pytorch3d expects [B, N, 3]
+            points_batch = points.unsqueeze(0)
+            _, indices = sample_farthest_points(points_batch, K=num_samples)
+            return indices.squeeze(0)
+        except ImportError:
+            pass
+        
+        # Try to use torch_cluster's FPS
+        try:
+            from torch_cluster import fps
+            batch = torch.zeros(N, dtype=torch.long)
+            ratio = num_samples / N
+            indices = fps(points, batch, ratio=ratio)[:num_samples]
+            return indices
+        except ImportError:
+            pass
+        
+        # Fallback: Simple CPU implementation
+        device = points.device
+        points = points.cpu().numpy()
+        
+        indices = np.zeros(num_samples, dtype=np.int64)
+        distances = np.full(N, np.inf)
+        
+        # Start with random point
+        indices[0] = np.random.randint(N)
+        
+        for i in range(1, num_samples):
+            last_point = points[indices[i-1]]
+            # Update distances
+            dist_to_last = np.sum((points - last_point) ** 2, axis=1)
+            distances = np.minimum(distances, dist_to_last)
+            # Select farthest point
+            indices[i] = np.argmax(distances)
+        
+        return torch.from_numpy(indices).to(device)
+    
     def point_map_to_concerto_input(
         self,
         point_map: torch.Tensor,  # [B, H, W, 3]
@@ -327,10 +383,9 @@ class ConcertoEncoder(nn.Module):
             
             N = coord.shape[0]
             
-            # Subsample if too many points
+            # Subsample if too many points using Farthest Point Sampling (FPS)
             if N > max_points:
-                # Random subsampling
-                indices = torch.randperm(N)[:max_points]
+                indices = self._fps_subsample(coord, max_points)
                 coord = coord[indices]
                 color = color[indices]
             
