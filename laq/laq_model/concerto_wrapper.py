@@ -242,19 +242,35 @@ class ConcertoEncoder(nn.Module):
     
     def _load_concerto(self, model_name: str):
         """Load pre-trained Concerto model."""
+        # Try multiple import approaches
         try:
             import concerto
+            print(f"Concerto package found at: {concerto.__file__}")
             model = concerto.model.load(
                 model_name,
                 repo_id="Pointcept/Concerto"
             ).to(self.device)
             print(f"Loaded Concerto model: {model_name}")
             return model
-        except ImportError:
-            print("Warning: concerto package not installed. Using dummy encoder.")
+        except ImportError as e:
+            print(f"Warning: concerto package not installed. Error: {e}")
+            print("Using dummy encoder.")
             return None
+        except AttributeError as e:
+            # concerto.model.load might not exist
+            print(f"Warning: concerto.model.load not found. Trying alternative...")
+            try:
+                from concerto.model import PointTransformerV3
+                model = PointTransformerV3.from_pretrained("Pointcept/Concerto").to(self.device)
+                print(f"Loaded Concerto model via PointTransformerV3: {model_name}")
+                return model
+            except Exception as e2:
+                print(f"Warning: Alternative load also failed: {e2}")
+                return None
         except Exception as e:
-            print(f"Warning: Failed to load Concerto model: {e}")
+            print(f"Warning: Failed to load Concerto model: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _setup_transform(self):
