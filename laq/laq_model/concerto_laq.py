@@ -23,6 +23,7 @@ from einops import rearrange, repeat
 from laq_model.attention import Transformer, ContinuousPositionBias
 from laq_model.concerto_wrapper import ConcertoEncoder
 from laq_model.latent_nsvq import LatentSpaceNSVQ
+from laq_model.vq_ema import LatentVQVAE
 
 
 def exists(val):
@@ -154,6 +155,7 @@ class ConcertoLAQ(nn.Module):
         use_depth: bool = True,
         depth_model_type: str = "dummy",
         use_precomputed_features: bool = False,
+        use_ema_vq: bool = True,  # Use VQ-EMA instead of NSVQ
     ):
         super().__init__()
         
@@ -206,14 +208,26 @@ class ConcertoLAQ(nn.Module):
         # Temporal difference encoder - process the delta between frames
         self.temporal_encoder = Transformer(depth=temporal_depth, **transformer_kwargs)
         
-        # Action quantizer (NSVQ)
-        self.action_quantizer = LatentSpaceNSVQ(
-            input_dim=dim,
-            embedding_dim=quant_dim,
-            num_embeddings=codebook_size,
-            code_seq_len=code_seq_len,
-            feature_size=feature_size,
-        )
+        # Action quantizer - choose between NSVQ and VQ-EMA
+        self.use_ema_vq = use_ema_vq
+        if use_ema_vq:
+            # VQ-EMA: More stable for low-dimensional latent spaces
+            self.action_quantizer = LatentVQVAE(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+            )
+        else:
+            # NSVQ: Original method from LAQ
+            self.action_quantizer = LatentSpaceNSVQ(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+            )
         
         # Latent predictor for training loss
         self.latent_predictor = LatentPredictor(
@@ -326,6 +340,7 @@ class ConcertoLAQ(nn.Module):
             indices: [B, code_seq_len] codebook indices
             perplexity: Codebook utilization
             decoded_delta: [B, H, W, dim] decoded feature difference
+            commitment_loss: VQ commitment loss (only for VQ-EMA)
         """
         B, H, W, D = features_t0.shape
         
@@ -342,22 +357,30 @@ class ConcertoLAQ(nn.Module):
         encoded_delta = rearrange(encoded_delta, 'b (h w) d -> b h w d', h=H, w=W)
         
         # Quantize to action codes
-        decoded_delta, perplexity, codebook_usage, indices = self.action_quantizer(
-            features_t0, features_t1
-        )
-        
-        # Handle codebook replacement during training
-        if self.training:
-            if ((step % 10 == 0 and step < 100) or 
-                (step % 100 == 0 and step < 1000) or 
-                (step % 500 == 0 and step < 5000)) and step != 0:
-                print(f"update codebook {step}")
-                self.action_quantizer.replace_unused_codebooks(decoded_delta.shape[0])
+        if self.use_ema_vq:
+            # VQ-EMA returns: (decoded, perplexity, commitment_loss, indices)
+            decoded_delta, perplexity, commitment_loss, indices = self.action_quantizer(
+                features_t0, features_t1
+            )
+        else:
+            # NSVQ returns: (decoded, perplexity, codebook_usage, indices)
+            decoded_delta, perplexity, codebook_usage, indices = self.action_quantizer(
+                features_t0, features_t1
+            )
+            commitment_loss = torch.tensor(0.0, device=decoded_delta.device)
+            
+            # Handle codebook replacement during training (NSVQ only)
+            if self.training:
+                if ((step % 10 == 0 and step < 100) or 
+                    (step % 100 == 0 and step < 1000) or 
+                    (step % 500 == 0 and step < 5000)) and step != 0:
+                    print(f"update codebook {step}")
+                    self.action_quantizer.replace_unused_codebooks(decoded_delta.shape[0])
         
         # Get quantized action tokens
         action_tokens = self.action_quantizer.codebooks[indices]  # [B, code_seq_len, quant_dim]
         
-        return action_tokens, indices, perplexity, decoded_delta
+        return action_tokens, indices, perplexity, decoded_delta, commitment_loss
     
     def predict_next_frame(
         self,
@@ -431,7 +454,7 @@ class ConcertoLAQ(nn.Module):
         encoded_t1 = self.encode_features(features_t1)
         
         # Compute and quantize action
-        action_tokens, indices, perplexity, decoded_delta = self.compute_action(
+        action_tokens, indices, perplexity, decoded_delta, commitment_loss = self.compute_action(
             encoded_t0, encoded_t1, step
         )
         
@@ -463,7 +486,6 @@ class ConcertoLAQ(nn.Module):
         entropy_loss = 1.0 - normalized_entropy
         
         # 2. Codebook spread loss: encourage codebook vectors to be spread out
-        # This prevents multiple similar codebook entries
         if hasattr(self, 'action_quantizer'):
             codebook = self.action_quantizer.codebooks  # [K, D]
             K, D = codebook.shape
@@ -477,29 +499,30 @@ class ConcertoLAQ(nn.Module):
             similarity_matrix = similarity_matrix.masked_fill(mask, -1)
             
             # Penalize high similarity between different codebook entries
-            # We want codebook entries to be diverse (low similarity)
-            max_similarity = similarity_matrix.max(dim=1)[0].mean()  # Average max similarity
-            spread_loss = max_similarity + 1.0  # Range [0, 2], want to minimize
+            max_similarity = similarity_matrix.max(dim=1)[0].mean()
+            spread_loss = max_similarity + 1.0  # Range [0, 2]
         else:
             spread_loss = torch.tensor(0.0, device=reconstruction_loss.device)
         
-        # 3. Usage balance loss: penalize if some codes are used way more than others
+        # 3. Usage balance loss
         if num_unique_indices > 1:
             usage_variance = probs[probs > 0].var()
-            balance_loss = usage_variance * 10.0  # Scale up
+            balance_loss = usage_variance * 10.0
         else:
-            balance_loss = torch.tensor(1.0, device=reconstruction_loss.device)  # Penalize single code
+            balance_loss = torch.tensor(1.0, device=reconstruction_loss.device)
         
-        # Total loss with strong diversity enforcement
-        entropy_weight = 2.0      # Strong entropy regularization
-        spread_weight = 0.5       # Codebook spread regularization
-        balance_weight = 0.1      # Usage balance
+        # Total loss - include commitment_loss for VQ-EMA
+        entropy_weight = 2.0
+        spread_weight = 0.5
+        balance_weight = 0.1
+        commitment_weight = 0.25  # Standard VQ-VAE commitment weight
         
         total_loss = (
             reconstruction_loss 
             + entropy_weight * entropy_loss 
             + spread_weight * spread_loss
             + balance_weight * balance_loss
+            + commitment_weight * commitment_loss
         )
         
         # Compute codebook utilization rate
@@ -509,6 +532,7 @@ class ConcertoLAQ(nn.Module):
         metrics = {
             'loss': total_loss,
             'reconstruction_loss': reconstruction_loss,
+            'commitment_loss': commitment_loss,
             'entropy_loss': entropy_loss,
             'spread_loss': spread_loss,
             'balance_loss': balance_loss,

@@ -272,15 +272,16 @@ def main():
             print(f"Step {step+1}/{args.num_steps} | "
                   f"Loss: {avg_loss:.4f} | "
                   f"Recon: {avg_metrics.get('reconstruction_loss', 0):.4f} | "
-                  f"Spread: {avg_metrics.get('spread_loss', 0):.3f} | "
+                  f"Commit: {avg_metrics.get('commitment_loss', 0):.4f} | "
                   f"Unique: {avg_unique:.1f} | "
                   f"Util: {avg_metrics.get('codebook_utilization', 0):.2%} | "
-                  f"LR: {lr:.2e}")
+                  f"Perp: {avg_metrics.get('perplexity', 0):.1f}")
             
             if args.use_wandb:
                 wandb.log({
                     "loss": avg_loss,
                     "reconstruction_loss": avg_metrics.get('reconstruction_loss', 0),
+                    "commitment_loss": avg_metrics.get('commitment_loss', 0),
                     "entropy_loss": avg_metrics.get('entropy_loss', 0),
                     "spread_loss": avg_metrics.get('spread_loss', 0),
                     "balance_loss": avg_metrics.get('balance_loss', 0),
@@ -295,6 +296,7 @@ def main():
             if tb_writer is not None:
                 tb_writer.add_scalar("train/loss", avg_loss, step+1)
                 tb_writer.add_scalar("train/reconstruction_loss", avg_metrics.get('reconstruction_loss', 0), step+1)
+                tb_writer.add_scalar("train/commitment_loss", avg_metrics.get('commitment_loss', 0), step+1)
                 tb_writer.add_scalar("train/entropy_loss", avg_metrics.get('entropy_loss', 0), step+1)
                 tb_writer.add_scalar("train/spread_loss", avg_metrics.get('spread_loss', 0), step+1)
                 tb_writer.add_scalar("train/balance_loss", avg_metrics.get('balance_loss', 0), step+1)
