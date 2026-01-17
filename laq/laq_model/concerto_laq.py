@@ -450,8 +450,9 @@ class ConcertoLAQ(nn.Module):
         
         # Get commitment loss from the quantizer
         commitment_loss = torch.tensor(0.0, device=reconstruction_loss.device)
-        if hasattr(self.action_encoder, 'quantizer') and hasattr(self.action_encoder.quantizer, 'commitment_loss'):
-            commitment_loss = self.action_encoder.quantizer.commitment_loss
+        if hasattr(self, 'action_quantizer') and hasattr(self.action_quantizer, 'quantizer'):
+            if hasattr(self.action_quantizer.quantizer, 'commitment_loss'):
+                commitment_loss = self.action_quantizer.quantizer.commitment_loss
         
         # Entropy regularization to encourage codebook diversity
         # Compute probability distribution over codebook usage
