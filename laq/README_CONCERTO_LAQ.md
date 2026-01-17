@@ -2,187 +2,267 @@
 
 This project integrates **Concerto** (joint 2D-3D self-supervised learning) with **LAQ** (Latent Action Quantization) to predict actions in a latent space with 3D awareness.
 
-## Architecture Overview
+---
+
+## 🏗️ Complete Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        Concerto-LAQ Pipeline                            │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│   Video Frame (t)              Video Frame (t+1)                       │
-│        │                             │                                  │
-│        ▼                             ▼                                  │
-│   ┌─────────┐                   ┌─────────┐                            │
-│   │  VGGT   │                   │  VGGT   │  ← Single-frame depth &    │
-│   │         │                   │         │    camera estimation       │
-│   └────┬────┘                   └────┬────┘                            │
-│        │                             │                                  │
-│        ▼                             ▼                                  │
-│   Point Cloud                   Point Cloud                            │
-│   [8K points]                   [8K points]  ← Subsampled              │
-│        │                             │                                  │
-│        ▼                             ▼                                  │
-│   ┌─────────┐                   ┌─────────┐                            │
-│   │Concerto │                   │Concerto │  ← PTv3 3D Transformer     │
-│   │ (PTv3)  │                   │ (PTv3)  │    features                │
-│   └────┬────┘                   └────┬────┘                            │
-│        │                             │                                  │
-│        ▼                             ▼                                  │
-│   Features [512]                Features [512]                         │
-│        │                             │                                  │
-│        └──────────┬──────────────────┘                                 │
-│                   ▼                                                     │
-│            ┌────────────┐                                              │
-│            │  Temporal  │  ← Compute difference between                │
-│            │   Encoder  │    frame features                            │
-│            └─────┬──────┘                                              │
-│                  │                                                      │
-│                  ▼                                                      │
-│            ┌────────────┐                                              │
-│            │    NSVQ    │  ← Normalize-Scale VQ for                    │
-│            │ Quantizer  │    discrete action codes                     │
-│            └─────┬──────┘                                              │
-│                  │                                                      │
-│                  ▼                                                      │
-│         Action Codes [4]  ← 4 discrete tokens per frame pair           │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                             Concerto-LAQ Pipeline                                 │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│    Frame t [224×224×3]              Frame t+1 [224×224×3]                       │
+│          │                                │                                      │
+│          ▼                                ▼                                      │
+│    ┌──────────┐                     ┌──────────┐                                │
+│    │   VGGT   │                     │   VGGT   │   Single-frame 3D estimation   │
+│    │    1B    │                     │    1B    │   - Depth map                  │
+│    └────┬─────┘                     └────┬─────┘   - Camera intrinsics          │
+│         │                                │         - Point cloud                 │
+│         ▼                                ▼                                       │
+│    Point Cloud                     Point Cloud                                  │
+│    [50K points]                    [50K points]                                 │
+│         │                                │                                       │
+│         ▼                                ▼                                       │
+│    ┌──────────┐                     ┌──────────┐                                │
+│    │ Subsample│                     │ Subsample│   Random sampling              │
+│    │  → 8K    │                     │  → 8K    │   (可切換為 FPS)               │
+│    └────┬─────┘                     └────┬─────┘                                │
+│         │                                │                                       │
+│         ▼                                ▼                                       │
+│    ┌──────────┐                     ┌──────────┐                                │
+│    │ Concerto │                     │ Concerto │   PTv3 3D Transformer          │
+│    │  (PTv3)  │                     │  (PTv3)  │   108M params (base)           │
+│    └────┬─────┘                     └────┬─────┘                                │
+│         │                                │                                       │
+│         ▼                                ▼                                       │
+│    [8K, 512]                        [8K, 512]     Sparse point features         │
+│         │                                │                                       │
+│         ▼                                ▼                                       │
+│    ┌──────────────┐                 ┌──────────────┐                            │
+│    │ Sparse-to-   │                 │ Sparse-to-   │   Learnable projection     │
+│    │ Dense (S2D)  │                 │ Dense (S2D)  │   Cross-attention          │
+│    └──────┬───────┘                 └──────┬───────┘                            │
+│           │                                │                                     │
+│           ▼                                ▼                                     │
+│    [14×14×512]                      [14×14×512]     Dense 2D features           │
+│           │                                │                                     │
+│           ▼                                ▼                                     │
+│    ┌──────────────┐                 ┌──────────────┐                            │
+│    │  Feature     │                 │  Feature     │   512 → model_dim          │
+│    │  Projection  │                 │  Projection  │                            │
+│    └──────┬───────┘                 └──────┬───────┘                            │
+│           │                                │                                     │
+│           ▼                                ▼                                     │
+│    ┌──────────────┐                 ┌──────────────┐                            │
+│    │   Spatial    │                 │   Spatial    │   Transformer encoder      │
+│    │   Encoder    │                 │   Encoder    │   with 2D pos encoding     │
+│    └──────┬───────┘                 └──────┬───────┘                            │
+│           │                                │                                     │
+│           └────────────┬───────────────────┘                                    │
+│                        ▼                                                         │
+│                ┌──────────────┐                                                 │
+│                │   Temporal   │   Compute difference between frame features    │
+│                │   Encoder    │                                                 │
+│                └──────┬───────┘                                                 │
+│                       │                                                          │
+│                       ▼                                                          │
+│                ┌──────────────┐                                                 │
+│                │     NSVQ     │   Normalize-Scale Vector Quantization          │
+│                │  Quantizer   │   Codebook: 256 codes                          │
+│                └──────┬───────┘                                                 │
+│                       │                                                          │
+│                       ▼                                                          │
+│               Action Codes [4]   4 discrete tokens per frame pair              │
+│                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Components
+---
 
-### 1. VGGT (Visual Geometry Grounded Transformer)
-- **Purpose**: Single-frame depth and camera intrinsic/extrinsic estimation
-- **Input**: RGB image [224×224]
-- **Output**: 
-  - Depth map [224×224]
-  - Point cloud [224×224, 3]
-  - Camera intrinsics [3×3]
-  - Camera extrinsics [4×4]
+## 🔍 Sparse-to-Dense Projection (Cross-Attention)
 
-### 2. Concerto (PTv3)
-- **Purpose**: Extract 2D+3D aware features from point clouds
-- **Input**: Point cloud [8K points, 9 features (coord + color + normal)]
-- **Output**: Per-point features [N, 512]
-- **Processing**: Global average pooling → [512] feature vector
+這是將稀疏點雲特徵 [N, 512] 轉換為密集 2D feature map [14×14, 512] 的核心模塊。
 
-### 3. LAQ (Latent Action Quantization)
-- **Purpose**: Quantize continuous features into discrete action codes
-- **Components**:
-  - Feature projection: 512 → model_dim
-  - Spatial encoder: Transformer for spatial features
-  - Temporal encoder: Compute difference between frames
-  - NSVQ Quantizer: Normalize-Scale Vector Quantization
-- **Output**: 4 discrete action tokens per frame pair
+### 原理
 
-## Installation
+使用類似 DETR 的 **Object Queries** 概念，但用於**空間特徵重建**：
 
-### Dependencies
+1. **Spatial Queries**: 可學習的 14×14=196 個位置查詢向量
+2. **Cross-Attention**: 每個查詢向量「詢問」所有點雲特徵，學習最相關的信息
+3. **輸出**: 每個空間位置得到一個聚合後的特徵向量
+
+### 詳細流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Cross-Attention 詳解                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   Point Features (Keys & Values)        Spatial Queries                    │
+│   ┌─────────────────────────┐           ┌──────────────────────┐           │
+│   │ p₁ p₂ p₃ ... p₈₁₉₂     │           │ q₁ q₂ ... q₁₉₆      │           │
+│   │ [8192, 512]             │           │ [196, 512]          │           │
+│   │ 從 Concerto 輸出        │           │ 可學習的位置向量    │           │
+│   └───────────┬─────────────┘           └──────────┬───────────┘           │
+│               │                                    │                        │
+│               │    ┌─────────────────────────────┐│                        │
+│               └───►│      Cross-Attention        │◄┘                        │
+│                    │                             │                          │
+│                    │  Attention(Q, K, V)         │                          │
+│                    │  Q = Spatial Queries        │                          │
+│                    │  K = Point Features         │                          │
+│                    │  V = Point Features         │                          │
+│                    │                             │                          │
+│                    │  attn = softmax(Q·K^T/√d)   │                          │
+│                    │  output = attn · V          │                          │
+│                    │                             │                          │
+│                    └──────────────┬──────────────┘                          │
+│                                   │                                          │
+│                                   ▼                                          │
+│                    ┌─────────────────────────────┐                          │
+│                    │     FFN (Feed-Forward)      │                          │
+│                    │     512 → 2048 → 512        │                          │
+│                    └──────────────┬──────────────┘                          │
+│                                   │                                          │
+│                                   ▼                                          │
+│                    ┌─────────────────────────────┐                          │
+│                    │  Reshape to 2D Grid         │                          │
+│                    │  [196, 512] → [14, 14, 512] │                          │
+│                    └─────────────────────────────┘                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 數學公式
+
+```
+# Cross-Attention
+Q = W_q @ spatial_queries           # [196, 512]
+K = W_k @ point_features            # [8192, 512]
+V = W_v @ point_features            # [8192, 512]
+
+attention_weights = softmax(Q @ K^T / sqrt(512))    # [196, 8192]
+output = attention_weights @ V                       # [196, 512]
+
+# 每個 spatial query 從所有 8192 個點中學習要關注哪些
+# 權重分布決定了如何聚合不同位置的點特徵
+```
+
+### 為什麼這樣設計？
+
+| 問題 | 解決方案 |
+|------|----------|
+| 點數不固定 (subsampled) | Attention 對任意長度 K,V 都適用 |
+| 需要固定輸出尺寸 | Query 數量固定 = 14×14 |
+| 保留空間關係 | 可學習的 positional encoding |
+| 全局信息整合 | 每個 query 看到所有點 |
+
+---
+
+## 📦 模塊詳解
+
+### 1. VGGTEncoder
+
+```python
+輸入: RGB image [B, 3, 224, 224]
+輸出: {
+    'depth_map': [B, 224, 224],        # 深度圖
+    'intrinsic': [B, 3, 3],            # 相機內參
+    'extrinsic': [B, 4, 4],            # 相機外參
+    'point_map': [B, 224, 224, 3],     # 3D 點座標
+}
+```
+
+### 2. ConcertoEncoder (PTv3)
+
+```python
+輸入: point_dict = {
+    'coord': [N, 3],       # 點座標 (已正規化到 [-1, 1])
+    'color': [N, 3],       # RGB 顏色
+    'normal': [N, 3],      # 法向量 (目前用 zeros)
+    'feat': [N, 9],        # coord + color + normal
+    'grid_coord': [N, 3],  # 體素格座標
+    'offset': [1],         # batch offset
+}
+輸出: {'feat': [N', 512]}  # N' 是 Concerto 內部處理後的點數
+```
+
+### 3. SparseToDenseProjection
+
+```python
+輸入: point_features [N, 512]
+輸出: dense_features [14, 14, 512]
+
+架構:
+- spatial_queries: Parameter([1, 196, 512])
+- query_pos: Learnable 2D positional encoding
+- layers: 2 × {CrossAttention, LayerNorm, FFN, LayerNorm}
+- output_norm: LayerNorm
+
+參數量: ~4.2M
+```
+
+### 4. ConcertoLAQ
+
+```python
+輸入: video [B, 3, 2, 224, 224]  # 兩幀
+輸出: (loss, num_unique_codes)
+
+子模塊:
+- feature_proj: 512 → model_dim (512)
+- spatial_encoder: Transformer × 4 layers
+- action_encoder: NSVQ Quantizer (256 codes, 4 tokens)
+```
+
+---
+
+## 📊 參數統計
+
+| 模塊 | 參數量 | 可訓練 |
+|------|--------|--------|
+| VGGT | ~1.3B | ❌ 凍結 |
+| Concerto (PTv3) | ~108M | ❌ 凍結 |
+| SparseToDense | ~4.2M | ✅ |
+| Feature Projection | ~0.5M | ✅ |
+| Spatial Encoder | ~25M | ✅ |
+| NSVQ Quantizer | ~12M | ✅ |
+| **Total Trainable** | **~42M** | |
+
+---
+
+## 🚀 使用方法
+
+### 安裝
+
 ```bash
-# Core dependencies
-pip install torch torchvision opencv-python einops
-
 # VGGT
 git clone https://github.com/facebookresearch/vggt.git
-cd vggt && pip install . && cd ..
+export PYTHONPATH=/path/to/vggt:$PYTHONPATH
 
 # Concerto
 git clone https://github.com/Pointcept/Concerto.git
-cd Concerto && pip install -e . && cd ..
+pip install -e Concerto/
 
-# Additional for Concerto
-pip install spconv-cu121  # Match your CUDA version
-pip install torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
+# Dependencies
+pip install spconv-cu121 torch-scatter -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
 ```
 
-### Environment Setup
-```bash
-export PYTHONPATH=/path/to/vggt:/path/to/Concerto:$PYTHONPATH
-```
+### 訓練
 
-## Usage
-
-### Training
 ```bash
-# Quick test
 python laq/train_concerto_laq.py \
     --data_dir /path/to/something-something-v2 \
-    --max_videos 100 \
     --batch_size 2 \
-    --num_steps 1000
-
-# Full training
-python laq/train_concerto_laq.py \
-    --data_dir /path/to/something-something-v2 \
-    --batch_size 8 \
     --num_steps 100000 \
-    --use_wandb
+    --lr 1e-4
 ```
 
-### Visualization
-```bash
-# Visualize point cloud from video
-python laq/visualize_vggt_pointcloud.py \
-    --video /path/to/video.webm \
-    --output output_viz/ \
-    --frame 30
-```
+---
 
-## Key Files
-
-| File | Description |
-|------|-------------|
-| `laq/laq_model/concerto_wrapper.py` | VGGT + Concerto encoder integration |
-| `laq/laq_model/concerto_laq.py` | Main ConcertoLAQ model |
-| `laq/laq_model/webm_dataset.py` | Dataset for .webm video files |
-| `laq/train_concerto_laq.py` | Training script |
-| `laq/visualize_vggt_pointcloud.py` | Point cloud visualization |
-
-## Configuration
-
-### Model Parameters
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `concerto_model` | `concerto_base` | Concerto model size |
-| `dim` | 512 | Model hidden dimension |
-| `codebook_size` | 256 | Number of discrete action codes |
-| `code_seq_len` | 4 | Action tokens per frame pair |
-| `spatial_depth` | 4 | Spatial transformer layers |
-| `temporal_depth` | 4 | Temporal transformer layers |
-
-### Data Parameters
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `frame_size` | 224 | Input frame size (must be divisible by 14) |
-| `frame_offset` | 5 | Frames between pair |
-| `max_points` | 8192 | Max points after subsampling |
-
-## Pipeline Details
-
-### Point Cloud Processing
-1. **VGGT Encoding**: RGB → Depth + Camera → Point Cloud
-2. **Subsampling**: 50K → 8K points (random sampling, FPS available)
-3. **Normalization**: Center and scale to [-1, 1]
-4. **Grid Voxelization**: For sparse convolution
-
-### Feature Extraction
-1. **Concerto Forward**: Point cloud → Per-point features [N, 512]
-2. **Global Pooling**: Average pool → [512] feature vector
-3. **Feature Projection**: [512] → [model_dim]
-
-### Action Quantization
-1. **Temporal Difference**: features_t1 - features_t0
-2. **NSVQ Quantization**: Continuous → Discrete codes
-3. **Output**: 4 action tokens representing the motion
-
-## Known Limitations
-
-1. **Global Pooling**: Currently loses spatial information. Future work: use sparse-to-dense projection.
-2. **No Surface Normals**: VGGT doesn't provide normals; using zeros as placeholder.
-3. **Memory Usage**: VGGT + Concerto requires ~40GB GPU memory for batch_size=2.
-
-## References
+## 📚 參考
 
 - [VGGT](https://github.com/facebookresearch/vggt): Visual Geometry Grounded Transformer
 - [Concerto](https://github.com/Pointcept/Concerto): Joint 2D-3D Self-Supervised Learning
 - [PTv3](https://github.com/Pointcept/PointTransformerV3): Point Transformer V3
+- [DETR](https://github.com/facebookresearch/detr): Object queries inspiration
