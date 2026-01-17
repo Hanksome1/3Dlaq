@@ -85,9 +85,14 @@ def parse_args():
                         help="Path to checkpoint to resume from")
     
     # Logging
-    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true",
+                        help="Use Weights & Biases for logging")
+    parser.add_argument("--use_tensorboard", action="store_true",
+                        help="Use TensorBoard for logging")
     parser.add_argument("--wandb_project", type=str, default="concerto-laq")
     parser.add_argument("--wandb_run", type=str, default=None)
+    parser.add_argument("--log_dir", type=str, default="./runs",
+                        help="TensorBoard log directory")
     
     return parser.parse_args()
 
@@ -110,6 +115,25 @@ def main():
             name=args.wandb_run,
             config=vars(args),
         )
+    
+    # Initialize TensorBoard
+    tb_writer = None
+    if args.use_tensorboard:
+        from torch.utils.tensorboard import SummaryWriter
+        from datetime import datetime
+        
+        # Create log directory with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = args.wandb_run or f"run_{timestamp}"
+        log_path = os.path.join(args.log_dir, run_name)
+        os.makedirs(log_path, exist_ok=True)
+        
+        tb_writer = SummaryWriter(log_path)
+        print(f"TensorBoard logs: {log_path}")
+        print(f"Run: tensorboard --logdir {args.log_dir}")
+        
+        # Log hyperparameters
+        tb_writer.add_text("hyperparameters", str(vars(args)))
     
     # Create dataloader
     print("\n" + "="*60)
@@ -247,6 +271,12 @@ def main():
                     "lr": lr,
                 }, step=step+1)
             
+            # TensorBoard logging
+            if tb_writer is not None:
+                tb_writer.add_scalar("train/loss", avg_loss, step+1)
+                tb_writer.add_scalar("train/unique_codes", avg_unique, step+1)
+                tb_writer.add_scalar("train/learning_rate", lr, step+1)
+            
             running_loss = 0.0
             running_unique = 0.0
         
@@ -276,6 +306,10 @@ def main():
     
     if args.use_wandb:
         wandb.finish()
+    
+    # Close TensorBoard writer
+    if tb_writer is not None:
+        tb_writer.close()
 
 
 if __name__ == "__main__":
