@@ -71,31 +71,38 @@ def parse_args():
                         help="Directory containing .webm video files")
     parser.add_argument("--max_videos", type=int, default=None,
                         help="Limit number of videos (for testing)")
-    parser.add_argument("--frame_size", type=int, default=224,
+    parser.add_argument("--frame_size", type=int, default=256,
                         help="Frame size (must be divisible by 14)")
-    parser.add_argument("--frame_offset", type=int, default=5,
-                        help="Frame offset between pairs")
+    parser.add_argument("--frame_offset", type=int, default=30,
+                        help="Frame offset between pairs (LAQ uses 30)")
     parser.add_argument("--samples_per_video", type=int, default=1,
                         help="Number of samples per video")
     
-    # Model
+    # Model - LAQ paper defaults
     parser.add_argument("--concerto_model", type=str, default="concerto_base",
                         choices=["concerto_small", "concerto_base", "concerto_large"])
-    parser.add_argument("--dim", type=int, default=512,
-                        help="Model dimension")
-    parser.add_argument("--codebook_size", type=int, default=256,
-                        help="Number of action codes")
+    parser.add_argument("--dim", type=int, default=1024,
+                        help="Model dimension (LAQ uses 1024)")
+    parser.add_argument("--quant_dim", type=int, default=32,
+                        help="Quantization embedding dimension (LAQ uses 32)")
+    parser.add_argument("--codebook_size", type=int, default=8,
+                        help="Number of action codes (LAQ uses 8)")
     parser.add_argument("--code_seq_len", type=int, default=4,
-                        help="Number of action tokens per frame pair")
-    parser.add_argument("--spatial_depth", type=int, default=4,
-                        help="Depth of spatial transformer")
-    parser.add_argument("--temporal_depth", type=int, default=4,
-                        help="Depth of temporal transformer")
+                        help="Number of action tokens per frame pair (LAQ uses 4)")
+    parser.add_argument("--spatial_depth", type=int, default=8,
+                        help="Depth of spatial transformer (LAQ uses 8)")
+    parser.add_argument("--temporal_depth", type=int, default=8,
+                        help="Depth of temporal transformer (LAQ uses 8)")
+    parser.add_argument("--heads", type=int, default=16,
+                        help="Number of attention heads (LAQ uses 16)")
+    parser.add_argument("--dim_head", type=int, default=64,
+                        help="Dimension per head (LAQ uses 64)")
     
-    # Training
-    parser.add_argument("--batch_size", type=int, default=4,
-                        help="Batch size per GPU")
-    parser.add_argument("--num_steps", type=int, default=100000)
+    # Training - LAQ paper defaults
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Batch size per GPU (total = batch_size * world_size)")
+    parser.add_argument("--num_steps", type=int, default=100005,
+                        help="Training steps (LAQ uses ~100K)")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_accum", type=int, default=1,
@@ -204,7 +211,7 @@ def main():
         concerto_model_name=args.concerto_model,
         concerto_dim=concerto_dims[args.concerto_model],
         dim=args.dim,
-        quant_dim=32,
+        quant_dim=args.quant_dim,
         codebook_size=args.codebook_size,
         code_seq_len=args.code_seq_len,
         image_size=args.frame_size,
@@ -212,6 +219,8 @@ def main():
         spatial_depth=args.spatial_depth,
         temporal_depth=args.temporal_depth,
         predictor_depth=4,
+        dim_head=args.dim_head,
+        heads=args.heads,
         freeze_concerto=True,
         use_precomputed_features=False,
     )
