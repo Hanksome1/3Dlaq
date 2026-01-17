@@ -399,6 +399,8 @@ class ConcertoEncoder(nn.Module):
                 output = self.concerto(point_dict)
             except Exception as e:
                 print(f"Concerto forward error: {e}")
+                import traceback
+                traceback.print_exc()
                 # Return dummy on error
                 feat = torch.randn(target_h, target_w, self.output_dim, device=self.device)
                 all_features.append(feat)
