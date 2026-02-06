@@ -25,6 +25,8 @@ from laq_model.concerto_wrapper import ConcertoEncoder
 from laq_model.latent_nsvq import LatentSpaceNSVQ
 from laq_model.vq_ema import LatentVQVAE
 from laq_model.gumbel_vq import GumbelLatentVQ
+from laq_model.pq_vae import LatentPQVAE
+from laq_model.ed_vae import LatentEDVAE
 
 
 def exists(val):
@@ -157,7 +159,7 @@ class ConcertoLAQ(nn.Module):
         depth_model_type: str = "dummy",
         use_precomputed_features: bool = False,
         use_ema_vq: bool = False,  # Deprecated, use vq_type instead
-        vq_type: str = "gumbel",   # "nsvq", "ema", or "gumbel"
+        vq_type: str = "gumbel",   # "nsvq", "ema", "gumbel", "pq", or "ed"
     ):
         super().__init__()
         
@@ -241,6 +243,27 @@ class ConcertoLAQ(nn.Module):
         else:
             # NSVQ: Original method from LAQ
             self.action_quantizer = LatentSpaceNSVQ(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+            )
+        elif vq_type == "pq":
+            # PQ-VAE: Product Quantization for larger effective codebook
+            print("Using PQ-VAE with 4 sub-quantizers")
+            self.action_quantizer = LatentPQVAE(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                num_groups=4,  # 4 sub-quantizers
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+            )
+        elif vq_type == "ed":
+            # edVAE: Evidential Discrete VAE for better codebook utilization
+            print("Using edVAE with evidential quantization")
+            self.action_quantizer = LatentEDVAE(
                 input_dim=dim,
                 embedding_dim=quant_dim,
                 num_embeddings=codebook_size,
@@ -376,8 +399,8 @@ class ConcertoLAQ(nn.Module):
         encoded_delta = rearrange(encoded_delta, 'b (h w) d -> b h w d', h=H, w=W)
         
         # Quantize to action codes
-        if self.vq_type in ["gumbel", "ema"]:
-            # Both Gumbel and VQ-EMA return: (decoded, perplexity, commitment_loss, indices)
+        if self.vq_type in ["gumbel", "ema", "pq", "ed"]:
+            # These types return: (decoded, perplexity, commitment_loss, indices)
             decoded_delta, perplexity, commitment_loss, indices = self.action_quantizer(
                 features_t0, features_t1
             )
