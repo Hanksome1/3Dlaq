@@ -97,6 +97,9 @@ def parse_args():
                         help="Number of attention heads (LAQ uses 16)")
     parser.add_argument("--dim_head", type=int, default=64,
                         help="Dimension per head (LAQ uses 64)")
+    parser.add_argument("--vq_type", type=str, default="gumbel",
+                        choices=["gumbel", "ema", "nsvq", "pq", "ed"],
+                        help="Type of VQ to use: gumbel(default), ema, nsvq, pq, ed")
     
     # Training - LAQ paper defaults
     parser.add_argument("--batch_size", type=int, default=16,
@@ -223,6 +226,7 @@ def main():
         heads=args.heads,
         freeze_concerto=True,
         use_precomputed_features=False,
+        vq_type=args.vq_type,
     )
     
     model = model.to(device)
