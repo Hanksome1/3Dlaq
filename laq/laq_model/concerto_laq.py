@@ -140,7 +140,7 @@ class ConcertoLAQ(nn.Module):
         self,
         *,
         concerto_model_name: str = "concerto_base",
-        concerto_dim: int = 256,
+        concerto_dim: int = 512,
         dim: int = 1024,
         quant_dim: int = 32,
         codebook_size: int = 8,
@@ -240,15 +240,6 @@ class ConcertoLAQ(nn.Module):
                 code_seq_len=code_seq_len,
                 feature_size=feature_size,
             )
-        else:
-            # NSVQ: Original method from LAQ
-            self.action_quantizer = LatentSpaceNSVQ(
-                input_dim=dim,
-                embedding_dim=quant_dim,
-                num_embeddings=codebook_size,
-                code_seq_len=code_seq_len,
-                feature_size=feature_size,
-            )
         elif vq_type == "pq":
             # PQ-VAE: Product Quantization for larger effective codebook
             print("Using PQ-VAE with 4 sub-quantizers")
@@ -264,6 +255,15 @@ class ConcertoLAQ(nn.Module):
             # edVAE: Evidential Discrete VAE for better codebook utilization
             print("Using edVAE with evidential quantization")
             self.action_quantizer = LatentEDVAE(
+                input_dim=dim,
+                embedding_dim=quant_dim,
+                num_embeddings=codebook_size,
+                code_seq_len=code_seq_len,
+                feature_size=feature_size,
+            )
+        else:
+            # NSVQ: Original method from LAQ
+            self.action_quantizer = LatentSpaceNSVQ(
                 input_dim=dim,
                 embedding_dim=quant_dim,
                 num_embeddings=codebook_size,

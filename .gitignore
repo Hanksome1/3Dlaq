@@ -1,3 +1,5 @@
 lapa_checkpoints/*
 __pycache__/
 wandb/*
+vggt/
+Concerto/
