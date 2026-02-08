@@ -420,8 +420,15 @@ class ConcertoLAQ(nn.Module):
                     self.action_quantizer.replace_unused_codebooks(decoded_delta.shape[0])
         
         # Get quantized action tokens
-        action_tokens = self.action_quantizer.codebooks[indices]  # [B, code_seq_len, quant_dim]
-        
+        if self.vq_type == "pq":
+            # PQ-VAE: re-encode to get quantized tokens (codebooks is per-group)
+            delta_for_encode = features_t1 - features_t0
+            encoded_tokens = self.action_quantizer.encode(delta_for_encode)  # [B, code_seq_len, quant_dim]
+            quantized_tokens, _, _, _ = self.action_quantizer.vq(encoded_tokens)
+            action_tokens = quantized_tokens  # [B, code_seq_len, quant_dim]
+        else:
+            action_tokens = self.action_quantizer.codebooks[indices]  # [B, code_seq_len, quant_dim]
+
         return action_tokens, indices, perplexity, decoded_delta, commitment_loss
     
     def predict_next_frame(
@@ -528,7 +535,7 @@ class ConcertoLAQ(nn.Module):
         entropy_loss = 1.0 - normalized_entropy
         
         # 2. Codebook spread loss: encourage codebook vectors to be spread out
-        if hasattr(self, 'action_quantizer'):
+        if hasattr(self, 'action_quantizer') and self.vq_type != "pq":
             codebook = self.action_quantizer.codebooks  # [K, D]
             K, D = codebook.shape
             
