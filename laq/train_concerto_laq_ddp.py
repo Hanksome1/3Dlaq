@@ -85,8 +85,8 @@ def parse_args():
                         help="Model dimension (LAQ uses 1024)")
     parser.add_argument("--quant_dim", type=int, default=32,
                         help="Quantization embedding dimension (LAQ uses 32)")
-    parser.add_argument("--codebook_size", type=int, default=8,
-                        help="Number of action codes (LAQ uses 8)")
+    parser.add_argument("--codebook_size", type=int, default=64,
+                        help="Number of action codes (default 64, LAQ paper uses 8 which is too small)")
     parser.add_argument("--code_seq_len", type=int, default=4,
                         help="Number of action tokens per frame pair (LAQ uses 4)")
     parser.add_argument("--spatial_depth", type=int, default=8,
@@ -286,18 +286,26 @@ def main():
     running_loss = 0.0
     running_unique = 0.0
     
+    # Create iterator ONCE outside the loop
+    current_epoch = 0
+    if sampler is not None:
+        sampler.set_epoch(current_epoch)
+    data_iter = iter(dataloader)
+    samples_per_epoch = len(dataloader)
+    
     for step in range(start_step, args.num_steps):
-        # Set epoch for distributed sampler
-        if sampler is not None:
-            sampler.set_epoch(step)
-        
-        # Get batch
-        data_iter = iter(dataloader)
+        # Get batch - iterate continuously
         try:
             batch = next(data_iter)
         except StopIteration:
+            # Epoch finished, start new epoch with different shuffle
+            current_epoch += 1
+            if sampler is not None:
+                sampler.set_epoch(current_epoch)
             data_iter = iter(dataloader)
             batch = next(data_iter)
+            if is_main_process():
+                print(f"Epoch {current_epoch} started")
         
         video = batch["video"].to(device)
         

@@ -116,9 +116,23 @@ class ProductQuantizer(nn.Module):
             self.codebooks[group_idx].data.copy_(
                 ema_sum / cluster_size_normalized.unsqueeze(1)
             )
+            
+            # Reset unused codes: find codes with very low usage and reinitialize
+            usage_threshold = max(1.0, n / (self.num_embeddings * 10))
+            unused_mask = ema_cluster < usage_threshold
+            num_unused = unused_mask.sum().item()
+            if num_unused > 0 and x.shape[0] >= num_unused:
+                # Sample random vectors from current batch
+                random_indices = torch.randperm(x.shape[0], device=x.device)[:int(num_unused)]
+                random_vectors = x[random_indices]
+                # Reset unused codes
+                self.codebooks[group_idx].data[unused_mask] = random_vectors + 0.01 * torch.randn_like(random_vectors)
+                # Reset EMA stats for these codes
+                ema_cluster.data[unused_mask] = 1.0
+                ema_sum.data[unused_mask] = random_vectors
         
-        # Commitment loss
-        commitment_loss = F.mse_loss(quantized.detach(), x)
+        # Commitment loss (stronger to prevent collapse)
+        commitment_loss = F.mse_loss(quantized.detach(), x) * 2.0
         
         # Straight-through estimator
         quantized = x + (quantized - x).detach()
