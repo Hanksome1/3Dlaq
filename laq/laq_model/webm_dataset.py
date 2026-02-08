@@ -204,6 +204,40 @@ class WebmVideoDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self) - 1))
 
 
+class PrecomputedFeaturesDataset(Dataset):
+    """
+    Dataset that loads precomputed VGGT+Concerto features from .pt files.
+
+    Each .pt file contains a tensor of shape [2, 14, 14, 512] (two frames).
+
+    Args:
+        features_dir: Directory containing .pt feature files
+        max_videos: Maximum number of files to use (None = all)
+    """
+
+    def __init__(
+        self,
+        features_dir: str,
+        max_videos: Optional[int] = None,
+    ):
+        self.features_dir = features_dir
+        self.feature_files = sorted(glob.glob(os.path.join(features_dir, "*.pt")))
+
+        if max_videos is not None:
+            self.feature_files = self.feature_files[:max_videos]
+
+        print(f"Found {len(self.feature_files)} precomputed feature files in {features_dir}")
+
+    def __len__(self):
+        return len(self.feature_files)
+
+    def __getitem__(self, idx: int) -> Dict[str, Union[torch.Tensor, str]]:
+        path = self.feature_files[idx]
+        features = torch.load(path, map_location="cpu", weights_only=True)  # [2, 14, 14, 512]
+        video_id = Path(path).stem
+        return {"features": features, "video_id": video_id}
+
+
 def collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Custom collate function for WebmVideoDataset."""
     videos = torch.stack([item["video"] for item in batch], dim=0)

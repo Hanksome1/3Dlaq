@@ -33,7 +33,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 sys.path.insert(0, str(Path(__file__).parent))
 
 from laq_model.concerto_laq import ConcertoLAQ
-from laq_model.webm_dataset import WebmVideoDataset
+from laq_model.webm_dataset import WebmVideoDataset, PrecomputedFeaturesDataset
 
 
 def setup_distributed():
@@ -67,8 +67,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Concerto-LAQ (Multi-GPU)")
     
     # Data
-    parser.add_argument("--data_dir", type=str, required=True,
-                        help="Directory containing .webm video files")
+    parser.add_argument("--data_dir", type=str, default=None,
+                        help="Directory containing .webm video files (required unless --use_precomputed_features)")
     parser.add_argument("--max_videos", type=int, default=None,
                         help="Limit number of videos (for testing)")
     parser.add_argument("--frame_size", type=int, default=224,
@@ -100,7 +100,13 @@ def parse_args():
     parser.add_argument("--vq_type", type=str, default="gumbel",
                         choices=["gumbel", "ema", "nsvq", "pq", "ed"],
                         help="Type of VQ to use: gumbel(default), ema, nsvq, pq, ed")
-    
+
+    # Precomputed features
+    parser.add_argument("--use_precomputed_features", action="store_true",
+                        help="Use precomputed VGGT+Concerto features instead of raw video")
+    parser.add_argument("--features_dir", type=str, default=None,
+                        help="Directory containing precomputed .pt feature files")
+
     # Training - LAQ paper defaults
     parser.add_argument("--batch_size", type=int, default=16,
                         help="Batch size per GPU (total = batch_size * world_size)")
@@ -168,13 +174,23 @@ def main():
         print("Loading Dataset")
         print("="*60)
     
-    dataset = WebmVideoDataset(
-        data_dir=args.data_dir,
-        frame_size=(args.frame_size, args.frame_size),
-        frame_offset=args.frame_offset,
-        num_samples_per_video=args.samples_per_video,
-        max_videos=args.max_videos,
-    )
+    if args.use_precomputed_features:
+        if args.features_dir is None:
+            raise ValueError("--features_dir is required when using --use_precomputed_features")
+        dataset = PrecomputedFeaturesDataset(
+            features_dir=args.features_dir,
+            max_videos=args.max_videos,
+        )
+    else:
+        if args.data_dir is None:
+            raise ValueError("--data_dir is required when not using --use_precomputed_features")
+        dataset = WebmVideoDataset(
+            data_dir=args.data_dir,
+            frame_size=(args.frame_size, args.frame_size),
+            frame_offset=args.frame_offset,
+            num_samples_per_video=args.samples_per_video,
+            max_videos=args.max_videos,
+        )
     
     # Distributed sampler
     if world_size > 1:
@@ -225,7 +241,7 @@ def main():
         dim_head=args.dim_head,
         heads=args.heads,
         freeze_concerto=True,
-        use_precomputed_features=False,
+        use_precomputed_features=args.use_precomputed_features,
         vq_type=args.vq_type,
     )
     
@@ -307,14 +323,18 @@ def main():
             if is_main_process():
                 print(f"Epoch {current_epoch} started")
         
-        video = batch["video"].to(device)
-        
+        # Prepare forward kwargs based on mode
+        if args.use_precomputed_features:
+            forward_kwargs = {"features": batch["features"].to(device), "step": step}
+        else:
+            forward_kwargs = {"video": batch["video"].to(device), "step": step}
+
         # Forward pass
         try:
             if world_size > 1:
-                loss, num_unique, metrics = model.module(video=video, step=step)
+                loss, num_unique, metrics = model.module(**forward_kwargs)
             else:
-                loss, num_unique, metrics = model(video=video, step=step)
+                loss, num_unique, metrics = model(**forward_kwargs)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 if is_main_process():
